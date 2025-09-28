@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  aki-utils-lambda
+
+  Sample SAM Template for aki-utils-lambda
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 128
+    Runtime: python3.12
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - production
+  WebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting othello board images
+    NoEcho: true
+
+Resources:
+  TumeOthelloFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/tume-othello/
+      Handler: app.lambda_handler
+      Timeout: 100
+      Environment:
+        Variables:
+          WEB_HOOK_URL: !Ref WebHookUrl
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(15 23 * * ? *) # Every day at 9 AM UTC
+            Description: Daily batch processing
+            Enabled: true
+      # Policies:
+      # - DynamoDBCrudPolicy:
+      #     TableName: !Ref UtilsTable
+
+      # CloudWatch Log Groups
+      # WebApiLogGroup:
+      #   Type: AWS::Logs::LogGroup
+      #   Properties:
+      #     LogGroupName: !Sub "/aws/lambda/utils-web-api-${Environment}"
+  #     RetentionInDays: 14
+
+  # BatchLogGroup:
+  #   Type: AWS::Logs::LogGroup
+  #   Properties:
+  #     LogGroupName: !Sub "/aws/lambda/utils-batch-${Environment}"
+  #     RetentionInDays: 14
+# Outputs:
+#   WebApiUrl:
+#     Description: "API Gateway endpoint URL for Web API function"
+#     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+
+#   WebApiFunctionArn:
+#     Description: "Web API Lambda Function ARN"
+#     Value: !GetAtt WebApiFunction.Arn
+
+#   TumeOthelloFunctionArn:
+#     Description: "Batch Lambda Function ARN"
+#     Value: !GetAtt TumeOthelloFunction.Arn
+
+#   DynamoDBTableName:
+#     Description: "DynamoDB table name"
+#     Value: !Ref UtilsTable

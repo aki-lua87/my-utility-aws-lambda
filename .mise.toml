@@ -1,0 +1,57 @@
+[tools]
+python = "3.12"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+_.file = ".env"
+
+[tasks.install]
+description = "pip install -r requirements.txt"
+run = "pip install -r requirements.txt"
+
+[tasks.dev]
+description = "Start SAM local development server"
+run = "sam local start-api --port 3000"
+
+[tasks.build]
+description = "Build SAM application"
+run = "sam build --use-container"
+
+[tasks.deploy]
+description = "Deploy to AWS"
+run = "sam deploy --guided  --config-env dev"
+
+[tasks.deploy-prod]
+description = "Deploy to production"
+run = "sam deploy --config-env production"
+
+[tasks.test]
+description = "Run tests"
+run = "python -m pytest tests/"
+
+[tasks.lint]
+description = "Run linting"
+run = "ruff check ."
+
+[tasks.format]
+description = "Format code"
+run = "ruff format ."
+
+[tasks.local-batch]
+description = "Run batch function locally"
+run = "sam local invoke BatchFunction"
+
+[tasks.logs]
+description = "Tail CloudWatch logs"
+run = "sam logs -n WebApiFunction --stack-name aki-utils-lambda --tail"
+
+[tasks.clean]
+description = "Clean virtual environment and build artifacts"
+run = [
+    "rm -rf .venv",
+    "rm -rf .aws-sam"
+]
+
+[tasks.exex-othello]
+description = "Execute Othello batch function locally"
+run = "sam local invoke TumeOthelloFunction --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\""
