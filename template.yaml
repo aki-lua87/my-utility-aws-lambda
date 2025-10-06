@@ -38,38 +38,6 @@ Resources:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(15 23 * * ? *) # Every day at 9 AM UTC
+            Schedule: cron(15 23 * * ? *) # Every day at 9 AM JST
             Description: Daily batch processing
             Enabled: true
-      # Policies:
-      # - DynamoDBCrudPolicy:
-      #     TableName: !Ref UtilsTable
-
-      # CloudWatch Log Groups
-      # WebApiLogGroup:
-      #   Type: AWS::Logs::LogGroup
-      #   Properties:
-      #     LogGroupName: !Sub "/aws/lambda/utils-web-api-${Environment}"
-  #     RetentionInDays: 14
-
-  # BatchLogGroup:
-  #   Type: AWS::Logs::LogGroup
-  #   Properties:
-  #     LogGroupName: !Sub "/aws/lambda/utils-batch-${Environment}"
-  #     RetentionInDays: 14
-# Outputs:
-#   WebApiUrl:
-#     Description: "API Gateway endpoint URL for Web API function"
-#     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
-
-#   WebApiFunctionArn:
-#     Description: "Web API Lambda Function ARN"
-#     Value: !GetAtt WebApiFunction.Arn
-
-#   TumeOthelloFunctionArn:
-#     Description: "Batch Lambda Function ARN"
-#     Value: !GetAtt TumeOthelloFunction.Arn
-
-#   DynamoDBTableName:
-#     Description: "DynamoDB table name"
-#     Value: !Ref UtilsTable

@@ -52,6 +52,6 @@ run = [
     "rm -rf .aws-sam"
 ]
 
-[tasks.exex-othello]
+[tasks.exec-othello]
 description = "Execute Othello batch function locally"
 run = "sam local invoke TumeOthelloFunction --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\""
