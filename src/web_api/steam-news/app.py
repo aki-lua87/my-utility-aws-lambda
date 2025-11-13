@@ -11,6 +11,7 @@ from typing import Any, Optional
 import boto3
 import requests
 from boto3.dynamodb.conditions import Key
+from email.utils import parsedate_to_datetime
 
 # Configure logging
 logger = logging.getLogger()
@@ -310,11 +311,9 @@ def get_news(event: dict[str, Any]) -> dict[str, Any]:
         # Sort by pub_date (newest first)
         # Parse pub_date and sort
         def parse_date(item):
-            from datetime import datetime
             pub_date = item.get("pub_date", "")
             try:
                 # Try to parse RFC 2822 format: "Thu, 30 Oct 2025 02:06:11 +0000"
-                from email.utils import parsedate_to_datetime
                 return parsedate_to_datetime(pub_date)
             except:
                 # Fallback to created_at

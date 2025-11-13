@@ -16,6 +16,7 @@ import boto3
 import feedparser
 import requests
 from boto3.dynamodb.conditions import Key
+import time
 
 # Configure logging
 logger = logging.getLogger()
@@ -25,9 +26,6 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource("dynamodb")
 table_name = os.environ.get("TABLE_NAME", "aki-utils-dev")
 table = dynamodb.Table(table_name)
-
-# Discord webhook URL
-webhook_url = os.environ.get("STEAM_NEWS_WEBHOOK_URL")
 
 # Constants
 P_KEY_PREFIX = "steam_news"
@@ -224,7 +222,6 @@ def batch_check_news_exists(app_id: str, guids: list[str]) -> set[str]:
             retry_count = 0
             while unprocessed and retry_count < 3:
                 logger.warning(f"Retrying {len(unprocessed)} unprocessed keys")
-                import time
 
                 time.sleep(2**retry_count)  # Exponential backoff
                 response = dynamodb.batch_get_item(RequestItems=unprocessed)
@@ -316,7 +313,9 @@ def post_to_discord(app_id: str, game_title: str, entry: Any, webhook_url: str =
         webhook_url: Discord webhook URL (optional)
     """
     if not webhook_url:
-        logger.warning(f"Discord webhook URL not configured for app {app_id}, skipping notification")
+        logger.warning(
+            f"Discord webhook URL not configured for app {app_id}, skipping notification"
+        )
         return
 
     try:
