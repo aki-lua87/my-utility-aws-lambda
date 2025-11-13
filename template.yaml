@@ -79,11 +79,23 @@ Resources:
         - DynamoDBCrudPolicy:
             TableName: !Ref AkiUtilsTable
       Events:
-        ScheduleEvent:
+        ScheduleEvent06:
           Type: Schedule
           Properties:
-            Schedule: cron(0 0 * * ? *) # Every day at 9 AM JST (0:00 UTC)
-            Description: Daily Steam news fetch
+            Schedule: cron(0 21 * * ? *) # Every day at 06:00 JST (21:00 UTC previous day)
+            Description: Daily Steam news fetch at 06:00 JST
+            Enabled: true
+        ScheduleEvent12:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 3 * * ? *) # Every day at 12:00 JST (03:00 UTC)
+            Description: Daily Steam news fetch at 12:00 JST
+            Enabled: true
+        ScheduleEvent18:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 9 * * ? *) # Every day at 18:00 JST (09:00 UTC)
+            Description: Daily Steam news fetch at 18:00 JST
             Enabled: true
 
   SteamNewsApiFunction:

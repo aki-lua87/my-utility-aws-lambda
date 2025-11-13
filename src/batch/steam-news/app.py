@@ -138,17 +138,28 @@ def process_app_id(app_id: str, game_title: str, webhook_url: str = None) -> int
             logger.warning(f"No entries found in RSS feed for app ID {app_id}")
             return 0
 
-        new_news_count = 0
-
-        # Process each news item
+        # Collect all GUIDs from feed entries
+        entry_map = {}  # guid -> entry
+        guids = []
         for entry in feed.entries:
             guid = entry.get("id") or entry.get("link")
             if not guid:
                 logger.warning("News item missing guid/id, skipping")
                 continue
+            entry_map[guid] = entry
+            guids.append(guid)
 
-            # Check if news already exists
-            if is_news_exists(app_id, guid):
+        if not guids:
+            logger.warning(f"No valid entries found in RSS feed for app ID {app_id}")
+            return 0
+
+        # Batch check which news items already exist
+        existing_guids = batch_check_news_exists(app_id, guids)
+
+        # Process only new news items
+        new_news_count = 0
+        for guid, entry in entry_map.items():
+            if guid in existing_guids:
                 logger.debug(f"News already exists: {guid}")
                 continue
 
@@ -189,6 +200,75 @@ def is_news_exists(app_id: str, guid: str) -> bool:
     except Exception as e:
         logger.error(f"Error checking news existence: {e}", exc_info=True)
         return False
+
+
+def batch_check_news_exists(app_id: str, guids: list[str]) -> set[str]:
+    """Check if multiple news items exist in DynamoDB using BatchGetItem.
+
+    Args:
+        app_id: Steam app ID
+        guids: List of news item GUIDs
+
+    Returns:
+        Set of GUIDs that exist in DynamoDB
+    """
+    if not guids:
+        return set()
+
+    try:
+        existing_guids = set()
+
+        # BatchGetItem supports up to 100 items at a time
+        for i in range(0, len(guids), 100):
+            batch_guids = guids[i : i + 100]
+
+            # Build keys for BatchGetItem
+            keys = []
+            guid_to_key = {}  # Map s_key back to original guid
+            for guid in batch_guids:
+                news_id = guid.split("/")[-1] if "/" in guid else guid
+                s_key = f"{NEWS_SK_PREFIX}{app_id}_{news_id}"
+                keys.append({"p_key": P_KEY_PREFIX, "s_key": s_key})
+                guid_to_key[s_key] = guid
+
+            # Execute BatchGetItem
+            response = dynamodb.batch_get_item(
+                RequestItems={table_name: {"Keys": keys, "ConsistentRead": False}}
+            )
+
+            # Process responses
+            if table_name in response.get("Responses", {}):
+                for item in response["Responses"][table_name]:
+                    s_key = item.get("s_key")
+                    if s_key in guid_to_key:
+                        existing_guids.add(guid_to_key[s_key])
+
+            # Handle unprocessed keys (throttling, etc.)
+            unprocessed = response.get("UnprocessedKeys", {})
+            retry_count = 0
+            while unprocessed and retry_count < 3:
+                logger.warning(f"Retrying {len(unprocessed)} unprocessed keys")
+                import time
+
+                time.sleep(2**retry_count)  # Exponential backoff
+                response = dynamodb.batch_get_item(RequestItems=unprocessed)
+
+                if table_name in response.get("Responses", {}):
+                    for item in response["Responses"][table_name]:
+                        s_key = item.get("s_key")
+                        if s_key in guid_to_key:
+                            existing_guids.add(guid_to_key[s_key])
+
+                unprocessed = response.get("UnprocessedKeys", {})
+                retry_count += 1
+
+        logger.info(f"Batch check: {len(existing_guids)} / {len(guids)} news items already exist")
+        return existing_guids
+
+    except Exception as e:
+        logger.error(f"Error in batch_check_news_exists: {e}", exc_info=True)
+        # Fallback to empty set on error
+        return set()
 
 
 def save_news(app_id: str, entry: Any) -> None:
