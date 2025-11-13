@@ -7,7 +7,7 @@ _.file = ".env"
 
 [tasks.install]
 description = "pip install -r requirements.txt"
-run = "pip install -r requirements.txt"
+run = "pip install -r requirements.dev.txt"
 
 [tasks.dev]
 description = "Start SAM local development server"
@@ -19,7 +19,7 @@ run = "sam build --use-container"
 
 [tasks.deploy]
 description = "Deploy to AWS"
-run = "sam deploy --guided  --config-env dev"
+run = "sam deploy --config-env dev --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\" SteamWebHookUrl=\"$STEAM_NEWS_WEBHOOK_URL\""
 
 [tasks.deploy-prod]
 description = "Deploy to production"
