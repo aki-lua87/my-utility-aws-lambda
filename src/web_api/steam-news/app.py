@@ -145,7 +145,7 @@ def register_app_id(event: dict[str, Any]) -> dict[str, Any]:
                     "statusCode": 404,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps(
-                        {"error": f"App ID {app_id} not found in Steam Store or failed to fetch"}
+                        {"error": f"Failed to retrieve game title for App ID {app_id}"}
                     ),
                 }
 
