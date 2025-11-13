@@ -178,30 +178,6 @@ def process_app_id(app_id: str, game_title: str, webhook_url: str = None) -> int
         return 0
 
 
-def is_news_exists(app_id: str, guid: str) -> bool:
-    """Check if a news item already exists in DynamoDB.
-
-    Args:
-        app_id: Steam app ID
-        guid: News item GUID
-
-    Returns:
-        True if news exists, False otherwise
-    """
-    try:
-        # Extract news ID from guid (last part of URL)
-        news_id = guid.split("/")[-1] if "/" in guid else guid
-        s_key = f"{NEWS_SK_PREFIX}{app_id}_{news_id}"
-
-        response = table.get_item(Key={"p_key": P_KEY_PREFIX, "s_key": s_key})
-
-        return "Item" in response
-
-    except Exception as e:
-        logger.error(f"Error checking news existence: {e}", exc_info=True)
-        return False
-
-
 def batch_check_news_exists(app_id: str, guids: list[str]) -> set[str]:
     """Check if multiple news items exist in DynamoDB using BatchGetItem.
 
