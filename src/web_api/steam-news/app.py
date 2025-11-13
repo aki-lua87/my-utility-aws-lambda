@@ -6,12 +6,12 @@ This API provides endpoints to manage Steam app IDs for news fetching.
 import json
 import logging
 import os
-from typing import Any, Optional
+from email.utils import parsedate_to_datetime
+from typing import Any
 
 import boto3
 import requests
 from boto3.dynamodb.conditions import Key
-from email.utils import parsedate_to_datetime
 
 # Configure logging
 logger = logging.getLogger()
@@ -28,7 +28,7 @@ APP_ID_SK_PREFIX = "appid_"
 NEWS_SK_PREFIX = "news_"
 
 
-def get_game_title_from_steam(app_id: str) -> Optional[str]:
+def get_game_title_from_steam(app_id: str) -> str | None:
     """Get game title from Steam Store API.
 
     Args:
@@ -138,7 +138,7 @@ def register_app_id(event: dict[str, Any]) -> dict[str, Any]:
 
         # If game_title not provided, fetch from Steam Store API
         if not game_title:
-            logger.info(f"Game title not provided, fetching from Steam Store API")
+            logger.info("Game title not provided, fetching from Steam Store API")
             game_title = get_game_title_from_steam(app_id)
 
             if not game_title:
@@ -315,7 +315,7 @@ def get_news(event: dict[str, Any]) -> dict[str, Any]:
             try:
                 # Try to parse RFC 2822 format: "Thu, 30 Oct 2025 02:06:11 +0000"
                 return parsedate_to_datetime(pub_date)
-            except:
+            except:  # noqa: E722
                 # Fallback to created_at
                 return item.get("created_at", "")
 

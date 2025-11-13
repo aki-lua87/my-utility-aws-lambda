@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -16,7 +17,6 @@ import boto3
 import feedparser
 import requests
 from boto3.dynamodb.conditions import Key
-import time
 
 # Configure logging
 logger = logging.getLogger()
