@@ -4,6 +4,7 @@ botocore>=1.34.0
 Pillow>=10.0.0
 requests>=2.31.0
 numpy>=1.26.0
+feedparser>=6.0.0
 
 # 開発用依存関係
 pytest>=7.4.0

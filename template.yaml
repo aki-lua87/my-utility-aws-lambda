@@ -23,8 +23,31 @@ Parameters:
     Type: String
     Description: Discord webhook URL for posting othello board images
     NoEcho: true
+  SteamWebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting Steam news
+    NoEcho: true
 
 Resources:
+  # DynamoDB Table
+  AkiUtilsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub aki-utils-${Environment}
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      AttributeDefinitions:
+        - AttributeName: p_key
+          AttributeType: S
+        - AttributeName: s_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: p_key
+          KeyType: HASH
+        - AttributeName: s_key
+          KeyType: RANGE
   TumeOthelloFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -41,3 +64,59 @@ Resources:
             Schedule: cron(15 23 * * ? *) # Every day at 9 AM JST
             Description: Daily batch processing
             Enabled: true
+
+  SteamNewsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/steam-news/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+          STEAM_NEWS_WEBHOOK_URL: !Ref SteamWebHookUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AkiUtilsTable
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(5 * * * ? *) # Every hour at 5 minutes past
+            Description: Hourly Steam news fetch at 5 minutes past every hour
+            Enabled: true
+
+  SteamNewsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/web_api/steam-news/
+      Handler: app.lambda_handler
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AkiUtilsTable
+      Events:
+        RegisterAppId:
+          Type: Api
+          Properties:
+            Path: /steam-news/appid
+            Method: POST
+        ListAppIds:
+          Type: Api
+          Properties:
+            Path: /steam-news/appids
+            Method: GET
+        GetNews:
+          Type: Api
+          Properties:
+            Path: /steam-news/news
+            Method: GET
+
+# API GatewayのURLを出力
+Outputs:
+  SteamNewsApiUrl:
+    Description: "API Gateway URL for Steam News API"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/"
