@@ -218,9 +218,7 @@ def list_app_ids(event: dict[str, Any]) -> dict[str, Any]:
                 "app_id": item.get("app_id"),
                 "game_title": item.get("game_title"),
             }
-            # Include webhook_url if it exists
-            if item.get("webhook_url"):
-                app_item["webhook_url"] = item.get("webhook_url")
+            # webhook_url is not included in response for security reasons
             app_ids.append(app_item)
 
         logger.info(f"Listed {len(app_ids)} app IDs")
