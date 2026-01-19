@@ -19,7 +19,7 @@ run = "sam build --use-container"
 
 [tasks.deploy]
 description = "Deploy to AWS"
-run = "sam deploy --config-env dev --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\" SteamWebHookUrl=\"$STEAM_NEWS_WEBHOOK_URL\""
+run = "sam deploy --config-env dev --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\" SteamWebHookUrl=\"$STEAM_NEWS_WEBHOOK_URL\" XzyWebHookUrl=\"$XZY_WEBHOOK_URL\""
 
 [tasks.test]
 description = "Run tests"
@@ -51,3 +51,11 @@ run = [
 [tasks.exec-othello]
 description = "Execute Othello batch function locally"
 run = "sam local invoke TumeOthelloFunction --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\""
+
+[tasks.exec-xzy-rank]
+description = "Execute XZY Rank batch function locally"
+run = "sam local invoke XzyRankFunction --parameter-overrides XzyWebHookUrl=\"$XZY_WEBHOOK_URL\""
+
+[tasks.test-xzy-rank]
+description = "Test XZY Rank batch function with test script"
+run = "cd src/batch/xzy-rank && python test_local.py"
