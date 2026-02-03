@@ -207,8 +207,8 @@ def format_ranking_message(data: list[dict[str, Any]], list_id: int) -> list[dic
     Returns:
         List of Discord embed dicts (may be multiple if data is large)
     """
-    # Sort by win_rate descending (should already be sorted from API)
-    sorted_data = sorted(data, key=lambda x: float(x.get("win_rate", 0)), reverse=True)
+    # Sort by on_rate descending (should already be sorted from API)
+    sorted_data = sorted(data, key=lambda x: float(x.get("on_rate", 0)), reverse=True)
 
     # Build all description lines
     description_lines = []
