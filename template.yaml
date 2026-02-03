@@ -136,7 +136,7 @@ Resources:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(0 16 ? * THU *) # Every Thursday at 1 AM JST (16:00 UTC Wednesday)
+            Schedule: cron(0 16 ? * WED *) # Every Thursday at 1 AM JST (16:00 UTC Wednesday)
             Description: Weekly XZY ranking data fetch every Thursday at 1 AM JST
             Enabled: true
 
