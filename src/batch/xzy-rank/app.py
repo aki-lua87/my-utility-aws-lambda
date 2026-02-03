@@ -232,51 +232,52 @@ def format_ranking_message(data: list[dict[str, Any]], list_id: int) -> list[dic
     for line in description_lines:
         line_length = len(line) + 1  # +1 for newline
         if current_length + line_length > max_length and current_lines:
-            # Create embed for current batch
-            embeds.append(create_embed_chunk(current_lines, list_id, len(embeds)))
+            # Create embed for current batch (not the last chunk yet)
+            embeds.append(create_embed_chunk(current_lines, list_id, len(embeds), is_last_chunk=False))
             current_lines = [line]
             current_length = line_length
         else:
             current_lines.append(line)
             current_length += line_length
 
-    # Add remaining lines
+    # Add remaining lines as the last chunk
     if current_lines:
-        embeds.append(create_embed_chunk(current_lines, list_id, len(embeds)))
+        embeds.append(create_embed_chunk(current_lines, list_id, len(embeds), is_last_chunk=True))
 
     return embeds
 
 
-def create_embed_chunk(lines: list[str], list_id: int, chunk_index: int) -> dict[str, Any]:
+def create_embed_chunk(lines: list[str], list_id: int, chunk_index: int, is_last_chunk: bool = False) -> dict[str, Any]:
     """Create a single embed chunk.
 
     Args:
         lines: Description lines for this chunk
         list_id: The list_id of the data
         chunk_index: Index of this chunk (0-based)
+        is_last_chunk: Whether this is the last chunk (footer/timestamp added only to last chunk)
 
     Returns:
         Discord embed dict
     """
     description = "\n".join(lines)
-    
+
     title = "今週の 2v2 キャラランキング (6000-8000帯)"
     if chunk_index > 0:
         title += f" (続き {chunk_index + 1})"
-    
+
     embed = {
         "title": title,
         "description": description,
         "color": 0x5865F2,  # Discord blurple color
     }
-    
-    # Add footer only to the last chunk (will be the first/only chunk initially)
-    if chunk_index == 0 or len(lines) < 50:  # Heuristic: if small, likely the last chunk
+
+    # Add footer only to the last chunk
+    if is_last_chunk:
         embed["footer"] = {
             "text": f"List ID: {list_id} | 取得日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         }
         embed["timestamp"] = datetime.now().isoformat()
-    
+
     return embed
 
 
@@ -290,7 +291,7 @@ def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) 
     """
     try:
         embeds = format_ranking_message(data, list_id)
-        
+
         # Discord allows up to 10 embeds per message
         # If we have more, send multiple messages
         for i in range(0, len(embeds), 10):
@@ -299,7 +300,7 @@ def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) 
 
             response = requests.post(webhook_url, json=payload, timeout=10)
             response.raise_for_status()
-            
+
             logger.info(f"Posted {len(batch_embeds)} embed(s) to Discord (batch {i//10 + 1})")
 
         logger.info(f"Posted ranking data to Discord (list_id: {list_id}, total embeds: {len(embeds)})")
