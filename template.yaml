@@ -27,6 +27,10 @@ Parameters:
     Type: String
     Description: Discord webhook URL for posting Steam news
     NoEcho: true
+  XzyWebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting XZY ranking data
+    NoEcho: true
 
 Resources:
   # DynamoDB Table
@@ -114,6 +118,27 @@ Resources:
           Properties:
             Path: /steam-news/news
             Method: GET
+
+  XzyRankFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/xzy-rank/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+          XZY_WEBHOOK_URL: !Ref XzyWebHookUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AkiUtilsTable
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 16 ? * THU *) # Every Thursday at 1 AM JST (16:00 UTC Wednesday)
+            Description: Weekly XZY ranking data fetch every Thursday at 1 AM JST
+            Enabled: true
 
 # API GatewayのURLを出力
 Outputs:
