@@ -66,3 +66,6 @@ htmlcov/
 *.tmp
 *.temp
 .claude
+
+# Test output images
+test_output_*.png
