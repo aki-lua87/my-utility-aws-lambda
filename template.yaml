@@ -33,6 +33,12 @@ Parameters:
     NoEcho: true
 
 Resources:
+  # S3 Bucket for image cache
+  XzyRankImageCacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aki-utils-xzy-rank-image-cache-${Environment}
+
   # DynamoDB Table
   AkiUtilsTable:
     Type: AWS::DynamoDB::Table
@@ -65,7 +71,7 @@ Resources:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(15 23 * * ? *) # Every day at 9 AM JST
+            Schedule: cron(15 23 * * ? *)
             Description: Daily batch processing
             Enabled: true
 
@@ -124,19 +130,22 @@ Resources:
     Properties:
       CodeUri: src/batch/xzy-rank/
       Handler: app.lambda_handler
-      Timeout: 60
+      Timeout: 120
       Environment:
         Variables:
           TABLE_NAME: !Ref AkiUtilsTable
           XZY_WEBHOOK_URL: !Ref XzyWebHookUrl
+          IMAGE_CACHE_BUCKET: !Ref XzyRankImageCacheBucket
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AkiUtilsTable
+        - S3CrudPolicy:
+            BucketName: !Ref XzyRankImageCacheBucket
       Events:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(0 16 ? * THU *) # Every Thursday at 1 AM JST (16:00 UTC Wednesday)
+            Schedule: cron(0 8 ? * THU *)
             Description: Weekly XZY ranking data fetch every Thursday at 1 AM JST
             Enabled: true
 

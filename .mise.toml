@@ -55,3 +55,7 @@ run = "sam local invoke TumeOthelloFunction --parameter-overrides WebHookUrl=\"$
 [tasks.exec-xzy-rank]
 description = "Execute XZY Rank batch function locally"
 run = "sam local invoke XzyRankFunction --parameter-overrides XzyWebHookUrl=\"$XZY_WEBHOOK_URL\""
+
+[tasks.xzy-rank-image]
+description = "Generate XZY ranking images locally"
+run = "python src/batch/xzy-rank/test_local.py"

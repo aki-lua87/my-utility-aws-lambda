@@ -4,11 +4,14 @@ This function fetches XZY battle record ranking data from API,
 stores the latest list_id in DynamoDB, and posts the data to Discord.
 """
 
+import hashlib
 import io
 import json
 import logging
 import os
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -24,6 +27,8 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource("dynamodb")
 table_name = os.environ.get("TABLE_NAME", "aki-utils-dev")
 table = dynamodb.Table(table_name)
+s3 = boto3.client("s3")
+image_cache_bucket = os.environ.get("IMAGE_CACHE_BUCKET", "")
 
 # Constants
 P_KEY = "xzy_rank"
@@ -31,6 +36,7 @@ S_KEY = "latest_list_id"
 API_BASE_URL = "https://xzy.shengtiangames.com/mini-game/xzy/battle-record/hot-rank"
 DEFAULT_LIST_ID = 106  # Starting list_id
 MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search
+IMAGE_CACHE_PREFIX = "images/"  # S3 key prefix for cached images
 
 # Image generation constants
 THUMBNAIL_SIZE = 80  # Character thumbnail size
@@ -52,6 +58,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         Response dict with status code and body
     """
     try:
+        t_start = time.time()
         logger.info("Starting XZY ranking data fetch")
 
         # Get Discord webhook URL from environment
@@ -61,25 +68,30 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return {"statusCode": 500, "body": json.dumps({"error": "Webhook URL not configured"})}
 
         # Get last list_id from DynamoDB
+        t0 = time.time()
         last_list_id = get_last_list_id()
-        logger.info(f"Last list_id from DynamoDB: {last_list_id}")
+        logger.info(f"[{time.time() - t0:.2f}s] get_last_list_id: {last_list_id}")
 
         # Search for the latest list_id with data
+        t0 = time.time()
         latest_data, latest_list_id = find_latest_data(last_list_id)
+        logger.info(f"[{time.time() - t0:.2f}s] find_latest_data: list_id={latest_list_id}, count={len(latest_data)}")
 
         if not latest_data:
             logger.warning("No new data found")
             return {"statusCode": 200, "body": json.dumps({"message": "No new data found"})}
 
-        logger.info(f"Found latest data with list_id: {latest_list_id}")
-
         # Save the latest list_id to DynamoDB
+        t0 = time.time()
         save_last_list_id(latest_list_id)
+        logger.info(f"[{time.time() - t0:.2f}s] save_last_list_id")
 
         # Post to Discord
+        t0 = time.time()
         post_to_discord(latest_data, latest_list_id, webhook_url)
+        logger.info(f"[{time.time() - t0:.2f}s] post_to_discord")
 
-        logger.info("Successfully completed XZY ranking data fetch")
+        logger.info(f"[{time.time() - t_start:.2f}s] total: Successfully completed XZY ranking data fetch")
         return {
             "statusCode": 200,
             "body": json.dumps(
@@ -304,40 +316,34 @@ def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) 
         sorted_data = sorted(data, key=lambda x: float(x.get("on_rate", 0)), reverse=True)
         
         # Generate ranking images
+        t0 = time.time()
         images = generate_ranking_images(sorted_data)
+        logger.info(f"[{time.time() - t0:.2f}s] generate_ranking_images: {len(images)} image(s)")
         
-        # Prepare embed message
-        embed = {
-            "title": "今週の 2v2 キャラランキング (6000-8000帯)",
-            "description": f"出場率順でソートしたキャラクターランキング\n全{len(sorted_data)}キャラクター",
-            "color": 0x5865F2,
-            "footer": {
-                "text": f"List ID: {list_id} | 取得日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # Post each image with the embed
+        # Post each image with content text on the first message
         for i, (filename, img) in enumerate(images):
             # Convert image to bytes
+            t0 = time.time()
             img_bytes = io.BytesIO()
             img.save(img_bytes, format="PNG")
             img_bytes.seek(0)
+            logger.info(f"[{time.time() - t0:.2f}s] encode image: {filename}")
             
             # Prepare multipart form data
             files = {
                 "file": (filename, img_bytes, "image/png")
             }
             
-            # Add embed only to the first message
+            # Add content text only to the first message
             if i == 0:
                 payload = {
-                    "embeds": [embed]
+                    "content": "今週の 2v2 キャラランキング (6000-8000帯)"
                 }
             else:
                 payload = {}
             
             # Post to Discord
+            t0 = time.time()
             response = requests.post(
                 webhook_url,
                 data={"payload_json": json.dumps(payload)},
@@ -345,8 +351,7 @@ def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) 
                 timeout=30
             )
             response.raise_for_status()
-            
-            logger.info(f"Posted image {i+1}/{len(images)} to Discord: {filename}")
+            logger.info(f"[{time.time() - t0:.2f}s] post image {i+1}/{len(images)} to Discord: {filename}")
         
         logger.info(f"Posted {len(images)} ranking images to Discord (list_id: {list_id})")
 
@@ -374,29 +379,91 @@ def group_by_cost(data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     return grouped
 
 
-def download_image(url: str, size: tuple[int, int] = None) -> Image.Image | None:
-    """Download and optionally resize an image from URL.
+def _s3_key_from_url(url: str) -> str:
+    """Generate S3 cache key from image URL."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    return f"{IMAGE_CACHE_PREFIX}{url_hash}.png"
+
+
+def _load_from_s3_cache(s3_key: str, size: tuple[int, int] | None) -> Image.Image | None:
+    """Try to load image from S3 cache.
+    
+    Returns:
+        PIL Image object or None if not cached
+    """
+    if not image_cache_bucket:
+        return None
+    try:
+        obj = s3.get_object(Bucket=image_cache_bucket, Key=s3_key)
+        img = Image.open(io.BytesIO(obj["Body"].read()))
+        if size:
+            img = img.resize(size, Image.Resampling.LANCZOS)
+        return img
+    except s3.exceptions.NoSuchKey:
+        return None
+    except Exception as e:
+        logger.warning(f"S3 cache read error ({s3_key}): {e}")
+        return None
+
+
+def _save_to_s3_cache(s3_key: str, img: Image.Image) -> None:
+    """Save image to S3 cache."""
+    if not image_cache_bucket:
+        return
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        s3.put_object(Bucket=image_cache_bucket, Key=s3_key, Body=buf, ContentType="image/png")
+        logger.info(f"Saved to S3 cache: {s3_key}")
+    except Exception as e:
+        logger.warning(f"S3 cache write error ({s3_key}): {e}")
+
+
+def download_image(url: str, size: tuple[int, int] = None, retries: int = 3) -> Image.Image | None:
+    """Download and optionally resize an image from URL. S3 cache is checked first.
     
     Args:
         url: Image URL
         size: Optional target size (width, height)
+        retries: Number of retry attempts on failure
         
     Returns:
         PIL Image object or None if download fails
     """
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        img = Image.open(io.BytesIO(response.content))
-        
-        if size:
-            img = img.resize(size, Image.Resampling.LANCZOS)
-        
-        return img
-    except Exception as e:
-        logger.warning(f"Failed to download image from {url}: {e}")
-        return None
+    s3_key = _s3_key_from_url(url)
+
+    # Check S3 cache first
+    cached = _load_from_s3_cache(s3_key, size)
+    if cached:
+        logger.info(f"S3 cache hit: {s3_key}")
+        return cached
+
+    # Download from origin with exponential backoff
+    for attempt in range(1, retries + 1):
+        timeout = 2 ** attempt  # 2s, 4s, 8s
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            
+            img = Image.open(io.BytesIO(response.content))
+
+            # Save original (unresized) image to S3 cache
+            _save_to_s3_cache(s3_key, img)
+
+            if size:
+                img = img.resize(size, Image.Resampling.LANCZOS)
+            
+            return img
+        except Exception as e:
+            if attempt < retries:
+                wait = 2 ** (attempt - 1)  # 1s, 2s
+                logger.warning(f"Failed to download image (attempt {attempt}/{retries}, timeout={timeout}s) from {url}: {e}, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.warning(f"Failed to download image from {url}: {e}")
+    
+    return None
 
 
 def create_placeholder_image(size: tuple[int, int]) -> Image.Image:
@@ -467,7 +534,7 @@ def generate_cost_image(cost: str, chars: list[dict[str, Any]]) -> Image.Image:
         PIL Image object
     """
     # Calculate image dimensions
-    max_chars_per_row = 8
+    max_chars_per_row = 4
     char_box_width = THUMBNAIL_SIZE + CHAR_SPACING
     char_box_height = THUMBNAIL_SIZE + CHAR_VERTICAL_SPACING
     
@@ -491,39 +558,57 @@ def generate_cost_image(cost: str, chars: list[dict[str, Any]]) -> Image.Image:
     draw.text((SECTION_MARGIN, SECTION_MARGIN), title, fill=(255, 255, 255), font=title_font)
     
     y_offset = SECTION_MARGIN + 40
-    
+
+    # Pre-fetch character info
+    char_infos = []
+    for char_data in chars:
+        role = char_data.get("role", {})
+        char_infos.append({
+            "avatar_url": role.get("avatar_link") or role.get("avatar_link_xcx") or role.get("img_preview"),
+            "name": role.get("name_jp", "Unknown"),
+            "win_rate": char_data.get("win_rate", "0"),
+            "on_rate": char_data.get("on_rate", "0"),
+            "ban_rate": char_data.get("ban_rate", "0"),
+        })
+
+    # Download all thumbnails in parallel
+    def fetch(idx: int, info: dict) -> tuple[int, Image.Image]:
+        t0 = time.time()
+        thumb = download_image(info["avatar_url"], (THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+        elapsed = time.time() - t0
+        if not thumb:
+            logger.info(f"[{elapsed:.2f}s] download failed, using placeholder: {info['name']}")
+            thumb = create_placeholder_image((THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+        else:
+            logger.info(f"[{elapsed:.2f}s] download OK: {info['name']}")
+        return idx, thumb
+
+    thumbnails: dict[int, Image.Image] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch, i, info): i for i, info in enumerate(char_infos)}
+        for future in as_completed(futures):
+            idx, thumb = future.result()
+            thumbnails[idx] = thumb
+
     # Draw characters in on_rate order
-    for i, char_data in enumerate(chars):
+    for i, info in enumerate(char_infos):
         col = i % max_chars_per_row
         row = i // max_chars_per_row
         
         x = SECTION_MARGIN + col * char_box_width
         y = y_offset + row * char_box_height
         
-        # Get character info
-        role = char_data.get("role", {})
-        avatar_url = role.get("avatar_link") or role.get("avatar_link_xcx") or role.get("img_preview")
-        name = role.get("name_jp", "Unknown")
-        win_rate = char_data.get("win_rate", "0")
-        on_rate = char_data.get("on_rate", "0")
-        ban_rate = char_data.get("ban_rate", "0")
-        
-        # Download and draw thumbnail
-        thumbnail = download_image(avatar_url, (THUMBNAIL_SIZE, THUMBNAIL_SIZE))
-        if not thumbnail:
-            thumbnail = create_placeholder_image((THUMBNAIL_SIZE, THUMBNAIL_SIZE))
-        
-        img.paste(thumbnail, (x, y))
+        img.paste(thumbnails[i], (x, y))
         
         # Draw stats below thumbnail
         stats_y = y + THUMBNAIL_SIZE + 5
         
         # Draw character name (truncate if too long)
-        name_display = name if len(name) <= 6 else name[:5] + "..."
+        name_display = info["name"] if len(info["name"]) <= 6 else info["name"][:5] + "..."
         draw.text((x, stats_y), name_display, fill=(220, 220, 220), font=stats_font)
-        draw.text((x, stats_y + 15), f"勝率: {win_rate}%", fill=(100, 200, 100), font=stats_font)
-        draw.text((x, stats_y + 28), f"出場率: {on_rate}%", fill=(100, 150, 255), font=stats_font)
-        draw.text((x, stats_y + 41), f"BAN率: {ban_rate}%", fill=(255, 100, 100), font=stats_font)
+        draw.text((x, stats_y + 15), f"勝率: {info['win_rate']}%", fill=(100, 200, 100), font=stats_font)
+        draw.text((x, stats_y + 28), f"出場率: {info['on_rate']}%", fill=(100, 150, 255), font=stats_font)
+        draw.text((x, stats_y + 41), f"BAN率: {info['ban_rate']}%", fill=(255, 100, 100), font=stats_font)
     
     return img
 
@@ -541,26 +626,14 @@ def generate_ranking_images(data: list[dict[str, Any]]) -> list[tuple[str, Image
     grouped = group_by_cost(data)
     
     # Generate individual cost images
-    cost_images = []
-    for cost in sorted(grouped.keys(), key=lambda x: float(x) if x != "Unknown" else 999):
+    result = []
+    for cost in sorted(grouped.keys(), key=lambda x: float(x) if x != "Unknown" else -1, reverse=True):
         chars = grouped[cost]
+        t0 = time.time()
         img = generate_cost_image(cost, chars)
-        cost_images.append(img)
+        cost_str = str(cost).replace(".", "_")
+        filename = f"xzy_rank_cost_{cost_str}.png"
+        logger.info(f"[{time.time() - t0:.2f}s] generate_cost_image: cost={cost}, chars={len(chars)}, size={img.width}x{img.height}px")
+        result.append((filename, img))
     
-    # Calculate total height for combined image
-    total_width = max(img.width for img in cost_images)
-    total_height = sum(img.height for img in cost_images)
-    
-    # Create combined image
-    combined_img = Image.new("RGB", (total_width, total_height), color=(30, 30, 40))
-    
-    # Paste each cost image vertically
-    y_offset = 0
-    for img in cost_images:
-        combined_img.paste(img, (0, y_offset))
-        y_offset += img.height
-    
-    filename = "xzy_rank_all_costs.png"
-    logger.info(f"Generated combined ranking image: {total_width}x{total_height}px")
-    
-    return [(filename, combined_img)]
+    return result
