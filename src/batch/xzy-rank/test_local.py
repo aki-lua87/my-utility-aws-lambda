@@ -9,6 +9,7 @@ import sys
 # Mock environment variables for local testing
 os.environ["TABLE_NAME"] = "aki-utils-dev"
 os.environ["XZY_WEBHOOK_URL"] = "YOUR_DISCORD_WEBHOOK_URL_HERE"  # Replace with actual webhook URL
+os.environ["BEDROCK_ANALYSIS_ENABLED"] = "true"  # Set to "true" to test Bedrock analysis
 
 # Mock AWS SDK if not available locally
 try:
@@ -18,7 +19,7 @@ except ImportError:
     sys.exit(1)
 
 # Import the Lambda handler
-from app import lambda_handler, fetch_ranking_data, format_ranking_message, generate_ranking_images
+from app import lambda_handler, fetch_ranking_data, format_ranking_message, generate_ranking_images, analyze_with_bedrock
 
 
 def test_fetch_data():
@@ -114,6 +115,49 @@ def test_generate_images(data):
     print(f"\n✓ All images saved successfully!")
 
 
+def test_bedrock_analysis(list_id: int):
+    """Test Bedrock analysis by comparing list_id vs list_id - 1 from API."""
+    print("\n" + "=" * 60)
+    print("Test 4: Bedrock Analysis (current vs previous list_id)")
+    print("=" * 60)
+
+    if os.environ.get("BEDROCK_ANALYSIS_ENABLED") != "true":
+        print("\n⚠️  BEDROCK_ANALYSIS_ENABLED is not set to 'true'")
+        print("   Edit test_local.py and set BEDROCK_ANALYSIS_ENABLED = 'true' to run this test")
+        return
+
+    prev_list_id = list_id - 1
+    print(f"\n  Current  list_id: {list_id}")
+    print(f"  Previous list_id: {prev_list_id}")
+
+    print(f"\n⏳ Fetching current data (list_id={list_id})...")
+    current_resp = fetch_ranking_data(list_id)
+    if not current_resp or current_resp.get("code") != 0 or not current_resp.get("data"):
+        print(f"✗ Failed to fetch current data (list_id={list_id})")
+        return
+    current_data = current_resp["data"]
+    print(f"✓ Current data: {len(current_data)} chars")
+
+    print(f"\n⏳ Fetching previous data (list_id={prev_list_id})...")
+    prev_resp = fetch_ranking_data(prev_list_id)
+    if not prev_resp or prev_resp.get("code") != 0 or not prev_resp.get("data"):
+        print(f"✗ Failed to fetch previous data (list_id={prev_list_id})")
+        return
+    previous_data = prev_resp["data"]
+    print(f"✓ Previous data: {len(previous_data)} chars")
+
+    print("\n⏳ Running Bedrock analysis...")
+    analysis = analyze_with_bedrock(current_data, previous_data)
+
+    if analysis:
+        print(f"\n✓ Analysis result ({len(analysis)} chars):\n")
+        print("-" * 60)
+        print(analysis)
+        print("-" * 60)
+    else:
+        print("✗ Analysis failed or returned empty")
+
+
 def test_full_lambda():
     """Test the full Lambda handler (optional)."""
     print("\n" + "=" * 60)
@@ -164,8 +208,13 @@ def main():
     
     # Test 3: Generate images (new image-based format)
     test_generate_images(data)
-    
-    # Test 4: Full Lambda (optional)
+
+    # Test 4: Bedrock analysis (current vs previous list_id from API)
+    if data.get("data"):
+        list_id = 106  # Adjust to the list_id used in test_fetch_data
+        test_bedrock_analysis(list_id)
+
+    # Test 5: Full Lambda (optional)
     test_full_lambda()
     
     print("\n" + "=" * 60)

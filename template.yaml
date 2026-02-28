@@ -136,11 +136,17 @@ Resources:
           TABLE_NAME: !Ref AkiUtilsTable
           XZY_WEBHOOK_URL: !Ref XzyWebHookUrl
           IMAGE_CACHE_BUCKET: !Ref XzyRankImageCacheBucket
+          BEDROCK_ANALYSIS_ENABLED: "true"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AkiUtilsTable
         - S3CrudPolicy:
             BucketName: !Ref XzyRankImageCacheBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
       Events:
         ScheduleEvent:
           Type: Schedule

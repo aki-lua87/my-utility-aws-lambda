@@ -28,7 +28,9 @@ dynamodb = boto3.resource("dynamodb")
 table_name = os.environ.get("TABLE_NAME", "aki-utils-dev")
 table = dynamodb.Table(table_name)
 s3 = boto3.client("s3")
+bedrock = boto3.client("bedrock-runtime", region_name="ap-northeast-1")
 image_cache_bucket = os.environ.get("IMAGE_CACHE_BUCKET", "")
+bedrock_analysis_enabled = os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false").lower() == "true"
 
 # Constants
 P_KEY = "xzy_rank"
@@ -37,6 +39,7 @@ API_BASE_URL = "https://xzy.shengtiangames.com/mini-game/xzy/battle-record/hot-r
 DEFAULT_LIST_ID = 106  # Starting list_id
 MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search
 IMAGE_CACHE_PREFIX = "images/"  # S3 key prefix for cached images
+BEDROCK_MODEL_ID = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 # Image generation constants
 THUMBNAIL_SIZE = 80  # Character thumbnail size
@@ -86,9 +89,37 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         save_last_list_id(latest_list_id)
         logger.info(f"[{time.time() - t0:.2f}s] save_last_list_id")
 
+        # Bedrock analysis (find a previous list_id with different data, up to 5 decrements)
+        analysis = None
+        if bedrock_analysis_enabled:
+            t0 = time.time()
+            current_shrunk = shrink_ranking_data(latest_data)
+            previous_data = None
+            prev_list_id = None
+
+            for decrement in range(1, 6):
+                candidate_id = latest_list_id - decrement
+                prev_response = fetch_ranking_data(candidate_id)
+                if not prev_response or prev_response.get("code") != 0 or not prev_response.get("data"):
+                    logger.warning(f"Could not fetch data for list_id {candidate_id}, stopping search")
+                    break
+                candidate_shrunk = shrink_ranking_data(prev_response["data"])
+                if candidate_shrunk != current_shrunk:
+                    previous_data = prev_response["data"]
+                    prev_list_id = candidate_id
+                    logger.info(f"Found different data at list_id {candidate_id} (decrement={decrement})")
+                    break
+                logger.info(f"list_id {candidate_id} is identical to current, trying next...")
+
+            if previous_data:
+                analysis = analyze_with_bedrock(latest_data, previous_data)
+                logger.info(f"[{time.time() - t0:.2f}s] bedrock analysis (list_id {latest_list_id} vs {prev_list_id})")
+            else:
+                logger.warning("No different previous data found within 5 decrements, skipping analysis")
+
         # Post to Discord
         t0 = time.time()
-        post_to_discord(latest_data, latest_list_id, webhook_url)
+        post_to_discord(latest_data, latest_list_id, webhook_url, analysis)
         logger.info(f"[{time.time() - t0:.2f}s] post_to_discord")
 
         logger.info(f"[{time.time() - t_start:.2f}s] total: Successfully completed XZY ranking data fetch")
@@ -150,6 +181,7 @@ def save_last_list_id(list_id: int) -> None:
     except Exception as e:
         logger.error(f"Error saving list_id to DynamoDB: {e}", exc_info=True)
         raise
+
 
 
 def fetch_ranking_data(list_id: int) -> dict[str, Any] | None:
@@ -303,13 +335,96 @@ def create_embed_chunk(lines: list[str], list_id: int, chunk_index: int) -> dict
     return embed
 
 
-def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) -> None:
+def shrink_ranking_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract only fields needed for analysis, sorted by on_rate descending.
+
+    Args:
+        data: Raw ranking data from API
+
+    Returns:
+        Minimal list with name_jp, cost, win_rate, on_rate, ban_rate only
+    """
+    return [
+        {
+            "name": item.get("role", {}).get("name_jp", "Unknown"),
+            "cost": item.get("role", {}).get("cost", "?"),
+            "win_rate": item.get("win_rate", "0"),
+            "on_rate": item.get("on_rate", "0"),
+            "ban_rate": item.get("ban_rate", "0"),
+        }
+        for item in sorted(data, key=lambda x: float(x.get("on_rate", 0)), reverse=True)
+    ]
+
+
+def analyze_with_bedrock(
+    current_data: list[dict[str, Any]],
+    previous_data: list[dict[str, Any]],
+) -> str | None:
+    """Analyze ranking changes using Amazon Bedrock (Claude).
+
+    Args:
+        current_data: Current week's ranking data
+        previous_data: Previous week's ranking data
+
+    Returns:
+        Analysis text or None if disabled/failed
+    """
+    if not bedrock_analysis_enabled:
+        return None
+
+    try:
+        current_summary = shrink_ranking_data(current_data)
+        previous_summary = shrink_ranking_data(previous_data)
+        logger.info(f"current_summary: {current_summary}")
+        logger.info(f"previous_summary: {previous_summary}")
+
+        prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
+先週と今週のランキングデータを比較して、日本語で簡潔に分析してください。
+
+# 先週のランキング（出場率順）
+{json.dumps(previous_summary, ensure_ascii=False, indent=2)}
+
+# 今週のランキング（出場率順）
+{json.dumps(current_summary, ensure_ascii=False, indent=2)}
+
+以下の観点で分析してください：
+- 出場率・勝率・BAN率が大きく変動したキャラ
+- 新たに注目されたキャラや評価が下がったキャラ
+- 今週の環境のポイント（2〜3行程度のサマリー）
+
+400文字以内でまとめてください。"""
+
+        response = bedrock.invoke_model(
+            modelId=BEDROCK_MODEL_ID,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 512,
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+        )
+        result = json.loads(response["body"].read())
+        analysis = result["content"][0]["text"]
+        logger.info(f"Bedrock analysis completed: {len(analysis)} chars")
+        return analysis
+
+    except Exception as e:
+        logger.error(f"Bedrock analysis failed: {e}", exc_info=True)
+        return None
+
+
+def post_to_discord(
+    data: list[dict[str, Any]],
+    list_id: int,
+    webhook_url: str,
+    analysis: str | None = None,
+) -> None:
     """Post ranking data to Discord webhook with images.
 
     Args:
         data: Ranking data from API
         list_id: The list_id of the data
         webhook_url: Discord webhook URL
+        analysis: Optional Bedrock analysis text
     """
     try:
         # Sort by on_rate for image generation
@@ -319,41 +434,35 @@ def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) 
         t0 = time.time()
         images = generate_ranking_images(sorted_data)
         logger.info(f"[{time.time() - t0:.2f}s] generate_ranking_images: {len(images)} image(s)")
-        
-        # Post each image with content text on the first message
-        for i, (filename, img) in enumerate(images):
-            # Convert image to bytes
-            t0 = time.time()
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format="PNG")
-            img_bytes.seek(0)
-            logger.info(f"[{time.time() - t0:.2f}s] encode image: {filename}")
-            
-            # Prepare multipart form data
-            files = {
-                "file": (filename, img_bytes, "image/png")
-            }
-            
-            # Add content text only to the first message
-            if i == 0:
-                payload = {
-                    "content": "今週の 2v2 キャラランキング (6000-8000帯)"
-                }
-            else:
-                payload = {}
-            
-            # Post to Discord
-            t0 = time.time()
-            response = requests.post(
-                webhook_url,
-                data={"payload_json": json.dumps(payload)},
-                files=files,
-                timeout=30
-            )
-            response.raise_for_status()
-            logger.info(f"[{time.time() - t0:.2f}s] post image {i+1}/{len(images)} to Discord: {filename}")
-        
-        logger.info(f"Posted {len(images)} ranking images to Discord (list_id: {list_id})")
+
+        # Encode all images to bytes
+        t0 = time.time()
+        encoded = []
+        for filename, img in images:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            encoded.append((filename, buf))
+        logger.info(f"[{time.time() - t0:.2f}s] encode {len(encoded)} images")
+
+        # Build content text
+        content = "今週の 2v2 キャラランキング (6000-8000帯)"
+        if analysis:
+            content += f"\n\n{analysis}"
+
+        # Attach all images in a single Discord message (max 10 files)
+        files = {f"files[{i}]": (filename, buf, "image/png") for i, (filename, buf) in enumerate(encoded)}
+        payload = {"content": content}
+
+        t0 = time.time()
+        response = requests.post(
+            webhook_url,
+            data={"payload_json": json.dumps(payload)},
+            files=files,
+            timeout=60
+        )
+        response.raise_for_status()
+        logger.info(f"[{time.time() - t0:.2f}s] posted {len(encoded)} images to Discord in single message")
 
     except Exception as e:
         logger.error(f"Error posting to Discord: {e}", exc_info=True)
