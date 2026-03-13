@@ -19,7 +19,7 @@ run = "sam build --use-container"
 
 [tasks.deploy]
 description = "Deploy to AWS"
-run = "sam deploy --config-env dev --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\" SteamWebHookUrl=\"$STEAM_NEWS_WEBHOOK_URL\" XzyWebHookUrl=\"$XZY_WEBHOOK_URL\""
+run = "sam deploy --config-env dev --parameter-overrides WebHookUrl=\"$WEB_HOOK_URL\" SteamWebHookUrl=\"$STEAM_NEWS_WEBHOOK_URL\" XzyWebHookUrl=\"$XZY_WEBHOOK_URL\" AwsCostWebHookUrl=\"$AWS_COST_WEBHOOK_URL\""
 
 [tasks.test]
 description = "Run tests"
