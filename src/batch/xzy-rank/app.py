@@ -9,14 +9,16 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import boto3
 import requests
+from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
 
 # Configure logging
@@ -35,11 +37,23 @@ bedrock_analysis_enabled = os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false").l
 # Constants
 P_KEY = "xzy_rank"
 S_KEY = "latest_list_id"
+S_KEY_NEWS = "latest_news_id"
 API_BASE_URL = "https://xzy.shengtiangames.com/mini-game/xzy/battle-record/hot-rank"
+NEWS_BASE_URL = "https://xzyjp.shengtiangames.com/newsInfo"
 DEFAULT_LIST_ID = 106  # Starting list_id
-MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search
+DEFAULT_NEWS_ID = 2423  # Starting news ID (as of 2026-03-13)
+MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search for ranking
+NEWS_MAX_INCREMENT = 15  # Maximum forward increments to find latest news ID
+NEWS_SEARCH_DAYS = 7  # Days of patch notes to collect for analysis
 IMAGE_CACHE_PREFIX = "images/"  # S3 key prefix for cached images
 BEDROCK_MODEL_ID = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+# Hiragana + Katakana unicode ranges for Japanese detection
+JAPANESE_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+# Keywords that indicate a patch note / update article
+PATCH_KEYWORDS = ["アップデート", "メンテナンス", "調整", "バランス", "修正", "強化", "弱体", "不具合"]
+# Title substrings that should be excluded from Bedrock analysis regardless of other conditions
+EXCLUDED_TITLE_KEYWORDS = ["星導使の", "PV"]
 
 # Image generation constants
 THUMBNAIL_SIZE = 80  # Character thumbnail size
@@ -89,14 +103,24 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         save_last_list_id(latest_list_id)
         logger.info(f"[{time.time() - t0:.2f}s] save_last_list_id")
 
-        # Bedrock analysis (find a previous list_id with different data, up to 5 decrements)
+        # Fetch patch notes from the past week (run regardless of bedrock_analysis_enabled
+        # so the latest news_id is always kept up to date in DynamoDB)
+        t0 = time.time()
+        last_news_id = get_last_news_id()
+        patch_notes, latest_news_id = fetch_recent_patch_notes(last_news_id)
+        save_last_news_id(latest_news_id)
+        logger.info(f"[{time.time() - t0:.2f}s] fetch_recent_patch_notes: {len(patch_notes)} patch notes, latest_news_id={latest_news_id}")
+
+        # Bedrock analysis (find previous list_ids with different data, up to 5 decrements each)
         analysis = None
         if bedrock_analysis_enabled:
             t0 = time.time()
             current_shrunk = shrink_ranking_data(latest_data)
             previous_data = None
             prev_list_id = None
+            two_weeks_ago_data = None
 
+            # Find previous week data (先週)
             for decrement in range(1, 6):
                 candidate_id = latest_list_id - decrement
                 prev_response = fetch_ranking_data(candidate_id)
@@ -107,13 +131,32 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 if candidate_shrunk != current_shrunk:
                     previous_data = prev_response["data"]
                     prev_list_id = candidate_id
-                    logger.info(f"Found different data at list_id {candidate_id} (decrement={decrement})")
+                    logger.info(f"Found previous week data at list_id {candidate_id} (decrement={decrement})")
                     break
                 logger.info(f"list_id {candidate_id} is identical to current, trying next...")
 
+            # Find two weeks ago data (先々週)
+            if previous_data and prev_list_id:
+                prev_shrunk = shrink_ranking_data(previous_data)
+                for decrement in range(1, 6):
+                    candidate_id = prev_list_id - decrement
+                    prev2_response = fetch_ranking_data(candidate_id)
+                    if not prev2_response or prev2_response.get("code") != 0 or not prev2_response.get("data"):
+                        logger.warning(f"Could not fetch two_weeks_ago data for list_id {candidate_id}, stopping search")
+                        break
+                    candidate_shrunk = shrink_ranking_data(prev2_response["data"])
+                    if candidate_shrunk != prev_shrunk:
+                        two_weeks_ago_data = prev2_response["data"]
+                        logger.info(f"Found two weeks ago data at list_id {candidate_id} (decrement={decrement})")
+                        break
+                    logger.info(f"list_id {candidate_id} is identical to previous week, trying next...")
+
             if previous_data:
-                analysis = analyze_with_bedrock(latest_data, previous_data)
-                logger.info(f"[{time.time() - t0:.2f}s] bedrock analysis (list_id {latest_list_id} vs {prev_list_id})")
+                analysis = analyze_with_bedrock(latest_data, previous_data, two_weeks_ago_data, patch_notes or None)
+                logger.info(
+                    f"[{time.time() - t0:.2f}s] bedrock analysis"
+                    f" (list_id {latest_list_id} vs {prev_list_id}" + (", two_weeks_ago included" if two_weeks_ago_data else "") + (f", {len(patch_notes)} patch notes" if patch_notes else "") + ")"
+                )
             else:
                 logger.warning("No different previous data found within 5 decrements, skipping analysis")
 
@@ -182,6 +225,203 @@ def save_last_list_id(list_id: int) -> None:
         logger.error(f"Error saving list_id to DynamoDB: {e}", exc_info=True)
         raise
 
+
+def get_last_news_id() -> int | None:
+    """Get the last processed news ID from DynamoDB.
+
+    Returns:
+        Last processed news ID, or None if not previously stored
+    """
+    try:
+        response = table.get_item(Key={"p_key": P_KEY, "s_key": S_KEY_NEWS})
+        if "Item" in response:
+            news_id = response["Item"].get("news_id")
+            logger.info(f"Retrieved news_id from DynamoDB: {news_id}")
+            return int(news_id) if news_id is not None else None
+        logger.info(f"No previous news_id found, will use default: {DEFAULT_NEWS_ID}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching news_id from DynamoDB: {e}", exc_info=True)
+        return None
+
+
+def save_last_news_id(news_id: int) -> None:
+    """Save the latest news ID to DynamoDB.
+
+    Args:
+        news_id: The latest news ID to save
+    """
+    try:
+        table.put_item(
+            Item={
+                "p_key": P_KEY,
+                "s_key": S_KEY_NEWS,
+                "news_id": news_id,
+                "updated_at": datetime.now().isoformat(),
+            }
+        )
+        logger.info(f"Saved news_id to DynamoDB: {news_id}")
+    except Exception as e:
+        logger.error(f"Error saving news_id to DynamoDB: {e}", exc_info=True)
+        raise
+
+
+def fetch_news_article(news_id: int) -> dict[str, Any] | None:
+    """Fetch and parse a news article from xzyjp.shengtiangames.com.
+
+    Args:
+        news_id: Article ID to fetch
+
+    Returns:
+        - Dict with id, url, title, date, content if the article exists
+        - None if the article does not exist (HTTP 404) – caller should stop scanning
+        - Dict with "_error": True if a transient error occurred – caller should skip and continue
+    """
+    url = f"{NEWS_BASE_URL}?id={news_id}"
+    try:
+        resp = requests.get(url, timeout=8)
+
+        if resp.status_code == 404:
+            logger.info(f"news_id {news_id} not found (404)")
+            return None
+
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer"]):
+            tag.decompose()
+
+        # Extract date from <p class='flex-0'>YYYY-MM-DD</p> (preferred)
+        # Fall back to first YYYY-MM-DD found anywhere in the page text
+        article_date: datetime | None = None
+        date_elem = soup.find("p", class_="flex-0")
+        if date_elem:
+            date_text = date_elem.get_text(strip=True)
+            m = re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text)
+            if m:
+                article_date = datetime.strptime(date_text, "%Y-%m-%d")
+        if article_date is None:
+            text_full = soup.get_text(separator="\n", strip=True)
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text_full)
+            if date_match:
+                article_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
+
+        title_elem = soup.find("h2") or soup.find("h1")
+        title = title_elem.get_text(strip=True) if title_elem else ""
+
+        text = soup.get_text(separator="\n", strip=True)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        content = "\n".join(lines[:60])
+
+        return {
+            "id": news_id,
+            "url": url,
+            "title": title,
+            "date": article_date,
+            "content": content,
+        }
+    except requests.HTTPError as e:
+        logger.warning(f"HTTP error fetching news {news_id}: {e}")
+        return {"_error": True}
+    except Exception as e:
+        logger.warning(f"Error fetching news {news_id}: {e}")
+        return {"_error": True}
+
+
+def is_japanese_article(article: dict[str, Any]) -> bool:
+    """Return True if the article contains Japanese (hiragana/katakana) text."""
+    text = article.get("title", "") + " " + article.get("content", "")
+    return bool(JAPANESE_RE.search(text))
+
+
+def is_excluded_article(article: dict[str, Any]) -> bool:
+    """Return True if the article should be excluded from Bedrock analysis by title."""
+    title = article.get("title", "")
+    return any(kw in title for kw in EXCLUDED_TITLE_KEYWORDS)
+
+
+def is_patch_note(article: dict[str, Any]) -> bool:
+    """Return True if the article is about updates / character adjustments."""
+    text = article.get("title", "") + article.get("content", "")
+    return any(kw in text for kw in PATCH_KEYWORDS)
+
+
+def fetch_recent_patch_notes(last_news_id: int | None) -> tuple[list[dict[str, Any]], int]:
+    """Fetch Japanese patch-note articles published within the last NEWS_SEARCH_DAYS days.
+
+    Strategy:
+    - Step 1 (forward scan): increment from last_news_id (or DEFAULT_NEWS_ID on first run)
+      to find the absolute latest published ID.
+    - Step 2 (backward scan): decrement one-by-one from the latest ID.
+      Stop immediately when:
+        (a) the article does not exist (HTTP 404) → end of published range, or
+        (b) the article's date is older than NEWS_SEARCH_DAYS days.
+      On transient fetch errors the ID is skipped and scanning continues.
+
+    Args:
+        last_news_id: Last stored news ID from DynamoDB (None on first run)
+
+    Returns:
+        Tuple of (patch_notes sorted newest-first, latest_news_id found)
+    """
+    start_id = last_news_id if last_news_id is not None else DEFAULT_NEWS_ID
+    cutoff = datetime.now() - timedelta(days=NEWS_SEARCH_DAYS)
+
+    # Step 1: Scan forward to find the absolute latest published ID
+    latest_id = start_id
+    for i in range(1, NEWS_MAX_INCREMENT + 1):
+        result = fetch_news_article(start_id + i)
+        if result is None:
+            # 404 – no article at this ID, stop forward scan
+            break
+        if result.get("_error"):
+            # Transient error – stop forward scan conservatively
+            break
+        latest_id = start_id + i
+        logger.info(f"Forward scan: found news_id {latest_id}")
+
+    logger.info(f"Latest news_id found: {latest_id} (started from {start_id})")
+
+    # Step 2: Sequential backward scan
+    # Stop on 404 (article doesn't exist) or date older than NEWS_SEARCH_DAYS.
+    patch_notes: list[dict[str, Any]] = []
+    for decrement in range(latest_id + 1):  # safety upper-bound: never loop more than latest_id times
+        nid = latest_id - decrement
+        if nid <= 0:
+            break
+
+        article = fetch_news_article(nid)
+
+        if article is None:
+            # 404: article does not exist – stop scanning
+            logger.info(f"news_id {nid} not found (404) – stopping backward scan")
+            break
+
+        if article.get("_error"):
+            # Transient error – skip this ID and continue
+            logger.info(f"news_id {nid} fetch error – skipping")
+            continue
+
+        if article["date"] is None:
+            # Date could not be parsed – skip but keep scanning
+            logger.info(f"news_id {nid} has no parseable date – skipping")
+            continue
+
+        if article["date"] < cutoff:
+            logger.info(f"news_id {nid} ({article['date'].date()}) is older than {NEWS_SEARCH_DAYS} days – stopping backward scan")
+            break
+
+        if is_excluded_article(article):
+            logger.info(f"Excluded news_id {nid} (title filter): {article['title'][:60]}")
+        elif is_japanese_article(article) and is_patch_note(article):
+            patch_notes.append(article)
+            logger.info(f"Patch note found: id={nid}, title={article['title'][:60]}, date={article['date'].date()}")
+        else:
+            reason = "non-Japanese" if not is_japanese_article(article) else "not a patch note"
+            logger.info(f"Skipped news_id {nid} ({reason}): {article['title'][:60]}")
+
+    logger.info(f"fetch_recent_patch_notes: {len(patch_notes)} patch notes in last {NEWS_SEARCH_DAYS} days")
+    return patch_notes, latest_id
 
 
 def fetch_ranking_data(list_id: int) -> dict[str, Any] | None:
@@ -314,24 +554,22 @@ def create_embed_chunk(lines: list[str], list_id: int, chunk_index: int) -> dict
         Discord embed dict
     """
     description = "\n".join(lines)
-    
+
     title = "今週の 2v2 キャラランキング (6000-8000帯)"
     if chunk_index > 0:
         title += f" (続き {chunk_index + 1})"
-    
+
     embed = {
         "title": title,
         "description": description,
         "color": 0x5865F2,  # Discord blurple color
     }
-    
+
     # Add footer only to the last chunk (will be the first/only chunk initially)
     if chunk_index == 0 or len(lines) < 50:  # Heuristic: if small, likely the last chunk
-        embed["footer"] = {
-            "text": f"List ID: {list_id} | 取得日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        }
+        embed["footer"] = {"text": f"List ID: {list_id} | 取得日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
         embed["timestamp"] = datetime.now().isoformat()
-    
+
     return embed
 
 
@@ -359,12 +597,16 @@ def shrink_ranking_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def analyze_with_bedrock(
     current_data: list[dict[str, Any]],
     previous_data: list[dict[str, Any]],
+    two_weeks_ago_data: list[dict[str, Any]] | None = None,
+    patch_notes: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Analyze ranking changes using Amazon Bedrock (Claude).
 
     Args:
         current_data: Current week's ranking data
         previous_data: Previous week's ranking data
+        two_weeks_ago_data: Two weeks ago ranking data (optional)
+        patch_notes: Japanese patch note articles from the past week (optional)
 
     Returns:
         Analysis text or None if disabled/failed
@@ -378,29 +620,62 @@ def analyze_with_bedrock(
         logger.info(f"current_summary: {current_summary}")
         logger.info(f"previous_summary: {previous_summary}")
 
-        prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
+        # Build patch notes section if available
+        patch_notes_section = ""
+        if patch_notes:
+            notes_text = "\n\n".join(f"### {note['title']} ({note['date'].strftime('%Y-%m-%d')})\n" + "\n".join(note["content"].splitlines()[:40]) for note in patch_notes)
+            patch_notes_section = f"\n\n# 直近1週間のキャラクター調整情報\n{notes_text}"
+
+        if two_weeks_ago_data:
+            two_weeks_ago_summary = shrink_ranking_data(two_weeks_ago_data)
+            logger.info(f"two_weeks_ago_summary: {two_weeks_ago_summary}")
+            prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
+過去3週分のランキングデータを比較して、日本語で簡潔に分析してください。
+
+# 先々週のランキング（出場率順）
+{json.dumps(two_weeks_ago_summary, ensure_ascii=False, indent=2)}
+
+# 先週のランキング（出場率順）
+{json.dumps(previous_summary, ensure_ascii=False, indent=2)}
+
+# 今週のランキング（出場率順）
+{json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}
+
+以下の観点で分析してください：
+- 出場率・勝率・BAN率が大きく変動したキャラ（特に今週の変化）
+- 先々週からの中期的なトレンド（継続して上昇・下降しているキャラ）
+- 新たに注目されたキャラや評価が下がったキャラ
+- 直近のアップデートによる調整がランキングに与えた影響（調整情報がある場合）
+- 今週の環境のポイント（2〜3行程度のサマリー）
+
+600文字以内でまとめてください。"""
+        else:
+            prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
 先週と今週のランキングデータを比較して、日本語で簡潔に分析してください。
 
 # 先週のランキング（出場率順）
 {json.dumps(previous_summary, ensure_ascii=False, indent=2)}
 
 # 今週のランキング（出場率順）
-{json.dumps(current_summary, ensure_ascii=False, indent=2)}
+{json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}
 
 以下の観点で分析してください：
 - 出場率・勝率・BAN率が大きく変動したキャラ
 - 新たに注目されたキャラや評価が下がったキャラ
+- 直近のアップデートによる調整がランキングに与えた影響（調整情報がある場合）
 - 今週の環境のポイント（2〜3行程度のサマリー）
 
-400文字以内でまとめてください。"""
+500文字以内でまとめてください。"""
 
         response = bedrock.invoke_model(
             modelId=BEDROCK_MODEL_ID,
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 512,
-                "messages": [{"role": "user", "content": prompt}],
-            }),
+            body=json.dumps(
+                {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 512,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+            ),
         )
         result = json.loads(response["body"].read())
         analysis = result["content"][0]["text"]
@@ -429,7 +704,7 @@ def post_to_discord(
     try:
         # Sort by on_rate for image generation
         sorted_data = sorted(data, key=lambda x: float(x.get("on_rate", 0)), reverse=True)
-        
+
         # Generate ranking images
         t0 = time.time()
         images = generate_ranking_images(sorted_data)
@@ -455,12 +730,7 @@ def post_to_discord(
         payload = {"content": content}
 
         t0 = time.time()
-        response = requests.post(
-            webhook_url,
-            data={"payload_json": json.dumps(payload)},
-            files=files,
-            timeout=60
-        )
+        response = requests.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files, timeout=60)
         response.raise_for_status()
         logger.info(f"[{time.time() - t0:.2f}s] posted {len(encoded)} images to Discord in single message")
 
@@ -471,20 +741,20 @@ def post_to_discord(
 
 def group_by_cost(data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Group characters by cost, maintaining on_rate sort order.
-    
+
     Args:
         data: Ranking data from API (should be pre-sorted by on_rate)
-        
+
     Returns:
         Dict: {cost: [characters sorted by on_rate]}
     """
     grouped = defaultdict(list)
-    
+
     for item in data:
         role = item.get("role", {})
         cost = role.get("cost", "Unknown")
         grouped[cost].append(item)
-    
+
     return grouped
 
 
@@ -496,7 +766,7 @@ def _s3_key_from_url(url: str) -> str:
 
 def _load_from_s3_cache(s3_key: str, size: tuple[int, int] | None) -> Image.Image | None:
     """Try to load image from S3 cache.
-    
+
     Returns:
         PIL Image object or None if not cached
     """
@@ -531,12 +801,12 @@ def _save_to_s3_cache(s3_key: str, img: Image.Image) -> None:
 
 def download_image(url: str, size: tuple[int, int] = None, retries: int = 3) -> Image.Image | None:
     """Download and optionally resize an image from URL. S3 cache is checked first.
-    
+
     Args:
         url: Image URL
         size: Optional target size (width, height)
         retries: Number of retry attempts on failure
-        
+
     Returns:
         PIL Image object or None if download fails
     """
@@ -550,11 +820,11 @@ def download_image(url: str, size: tuple[int, int] = None, retries: int = 3) -> 
 
     # Download from origin with exponential backoff
     for attempt in range(1, retries + 1):
-        timeout = 2 ** attempt  # 2s, 4s, 8s
+        timeout = 2**attempt  # 2s, 4s, 8s
         try:
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()
-            
+
             img = Image.open(io.BytesIO(response.content))
 
             # Save original (unresized) image to S3 cache
@@ -562,7 +832,7 @@ def download_image(url: str, size: tuple[int, int] = None, retries: int = 3) -> 
 
             if size:
                 img = img.resize(size, Image.Resampling.LANCZOS)
-            
+
             return img
         except Exception as e:
             if attempt < retries:
@@ -571,22 +841,22 @@ def download_image(url: str, size: tuple[int, int] = None, retries: int = 3) -> 
                 time.sleep(wait)
             else:
                 logger.warning(f"Failed to download image from {url}: {e}")
-    
+
     return None
 
 
 def create_placeholder_image(size: tuple[int, int]) -> Image.Image:
     """Create a placeholder image when character thumbnail is unavailable.
-    
+
     Args:
         size: Image size (width, height)
-        
+
     Returns:
         PIL Image object
     """
     img = Image.new("RGB", size, color=(50, 50, 50))
     draw = ImageDraw.Draw(img)
-    
+
     # Draw a simple "?" in the center
     text = "?"
     # Use default font for now
@@ -595,22 +865,22 @@ def create_placeholder_image(size: tuple[int, int]) -> Image.Image:
     text_height = bbox[3] - bbox[1]
     position = ((size[0] - text_width) // 2, (size[1] - text_height) // 2)
     draw.text(position, text, fill=(200, 200, 200))
-    
+
     return img
 
 
 def get_font(size: int) -> ImageFont.FreeTypeFont:
     """Get font for text rendering. Falls back to default if custom font unavailable.
-    
+
     Args:
         size: Font size
-        
+
     Returns:
         ImageFont object
     """
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     # Try to use Japanese font if available
     font_paths = [
         os.path.join(script_dir, "fonts", "NotoSansJP-Regular.ttf"),  # Local font
@@ -620,25 +890,25 @@ def get_font(size: int) -> ImageFont.FreeTypeFont:
         "C:\\Windows\\Fonts\\msgothic.ttc",  # Windows
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ]
-    
+
     for font_path in font_paths:
         try:
             return ImageFont.truetype(font_path, size)
-        except (OSError, IOError):
+        except OSError:
             continue
-    
+
     # Fallback to default font
-    logger.warning(f"Japanese font not found, using default font")
+    logger.warning("Japanese font not found, using default font")
     return ImageFont.load_default()
 
 
 def generate_cost_image(cost: str, chars: list[dict[str, Any]]) -> Image.Image:
     """Generate ranking image for a specific cost category.
-    
+
     Args:
         cost: Cost value (e.g., "1.0", "1.5")
         chars: List of characters sorted by on_rate
-        
+
     Returns:
         PIL Image object
     """
@@ -646,39 +916,41 @@ def generate_cost_image(cost: str, chars: list[dict[str, Any]]) -> Image.Image:
     max_chars_per_row = 4
     char_box_width = THUMBNAIL_SIZE + CHAR_SPACING
     char_box_height = THUMBNAIL_SIZE + CHAR_VERTICAL_SPACING
-    
+
     # Calculate total height needed
     rows = (len(chars) + max_chars_per_row - 1) // max_chars_per_row
     total_height = SECTION_MARGIN  # Top margin
     total_height += 40  # Title height
     total_height += rows * char_box_height
     total_height += SECTION_MARGIN  # Bottom margin
-    
+
     img_width = SECTION_MARGIN * 2 + max_chars_per_row * char_box_width
     img = Image.new("RGB", (img_width, total_height), color=(30, 30, 40))
     draw = ImageDraw.Draw(img)
-    
+
     # Fonts
     title_font = get_font(FONT_SIZE_TITLE)
     stats_font = get_font(FONT_SIZE_STATS)
-    
+
     # Draw title
     title = f"コスト {cost} (出場率順)"
     draw.text((SECTION_MARGIN, SECTION_MARGIN), title, fill=(255, 255, 255), font=title_font)
-    
+
     y_offset = SECTION_MARGIN + 40
 
     # Pre-fetch character info
     char_infos = []
     for char_data in chars:
         role = char_data.get("role", {})
-        char_infos.append({
-            "avatar_url": role.get("avatar_link") or role.get("avatar_link_xcx") or role.get("img_preview"),
-            "name": role.get("name_jp", "Unknown"),
-            "win_rate": char_data.get("win_rate", "0"),
-            "on_rate": char_data.get("on_rate", "0"),
-            "ban_rate": char_data.get("ban_rate", "0"),
-        })
+        char_infos.append(
+            {
+                "avatar_url": role.get("avatar_link") or role.get("avatar_link_xcx") or role.get("img_preview"),
+                "name": role.get("name_jp", "Unknown"),
+                "win_rate": char_data.get("win_rate", "0"),
+                "on_rate": char_data.get("on_rate", "0"),
+                "ban_rate": char_data.get("ban_rate", "0"),
+            }
+        )
 
     # Download all thumbnails in parallel
     def fetch(idx: int, info: dict) -> tuple[int, Image.Image]:
@@ -703,37 +975,37 @@ def generate_cost_image(cost: str, chars: list[dict[str, Any]]) -> Image.Image:
     for i, info in enumerate(char_infos):
         col = i % max_chars_per_row
         row = i // max_chars_per_row
-        
+
         x = SECTION_MARGIN + col * char_box_width
         y = y_offset + row * char_box_height
-        
+
         img.paste(thumbnails[i], (x, y))
-        
+
         # Draw stats below thumbnail
         stats_y = y + THUMBNAIL_SIZE + 5
-        
+
         # Draw character name (truncate if too long)
         name_display = info["name"] if len(info["name"]) <= 6 else info["name"][:5] + "..."
         draw.text((x, stats_y), name_display, fill=(220, 220, 220), font=stats_font)
         draw.text((x, stats_y + 15), f"勝率: {info['win_rate']}%", fill=(100, 200, 100), font=stats_font)
         draw.text((x, stats_y + 28), f"出場率: {info['on_rate']}%", fill=(100, 150, 255), font=stats_font)
         draw.text((x, stats_y + 41), f"BAN率: {info['ban_rate']}%", fill=(255, 100, 100), font=stats_font)
-    
+
     return img
 
 
 def generate_ranking_images(data: list[dict[str, Any]]) -> list[tuple[str, Image.Image]]:
     """Generate a single ranking image with all costs.
-    
+
     Args:
         data: Ranking data from API (should be pre-sorted by on_rate)
-        
+
     Returns:
         List with single (filename, image) tuple
     """
     # Group by cost (maintaining on_rate sort order)
     grouped = group_by_cost(data)
-    
+
     # Generate individual cost images
     result = []
     for cost in sorted(grouped.keys(), key=lambda x: float(x) if x != "Unknown" else -1, reverse=True):
@@ -744,5 +1016,5 @@ def generate_ranking_images(data: list[dict[str, Any]]) -> list[tuple[str, Image
         filename = f"xzy_rank_cost_{cost_str}.png"
         logger.info(f"[{time.time() - t0:.2f}s] generate_cost_image: cost={cost}, chars={len(chars)}, size={img.width}x{img.height}px")
         result.append((filename, img))
-    
+
     return result
