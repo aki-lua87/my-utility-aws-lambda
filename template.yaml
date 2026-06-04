@@ -31,6 +31,14 @@ Parameters:
     Type: String
     Description: Discord webhook URL for posting XZY ranking data
     NoEcho: true
+  AwsCostWebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting monthly AWS cost report
+    NoEcho: true
+  SteamNewGamesWebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting new Steam game notifications
+    NoEcho: true
 
 Resources:
   # S3 Bucket for image cache
@@ -151,8 +159,76 @@ Resources:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(0 8 ? * THU *)
+            Schedule: cron(0 3 ? * THU *)
             Description: Weekly XZY ranking data fetch every Thursday at 1 AM JST
+            Enabled: true
+
+  SteamNewGamesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/steam-new-games/
+      Handler: app.lambda_handler
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+          STEAM_NEW_GAMES_WEBHOOK_URL: !Ref SteamNewGamesWebHookUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AkiUtilsTable
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 4 * * ? *) # Daily at 12:00 JST
+            Description: Daily Steam new games check
+            Enabled: true
+
+  AwsCostDailyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/aws-cost/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          AWS_COST_WEBHOOK_URL: !Ref AwsCostWebHookUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:GetMetricStatistics
+                - cloudwatch:ListMetrics
+              Resource: "*"
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 3 * * ? *)
+            Description: Daily AWS cost report at 12:00 JST (CloudWatch Metrics / free)
+            Enabled: true
+
+  AwsCostMonthlyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/aws-cost/
+      Handler: app_monthly.lambda_handler_monthly
+      Timeout: 30
+      Environment:
+        Variables:
+          AWS_COST_WEBHOOK_URL: !Ref AwsCostWebHookUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ce:GetCostAndUsage
+              Resource: "*"
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 3 1 * ? *)
+            Description: Monthly AWS cost report on 1st of each month at 12:00 JST (Cost Explorer / $0.01)
             Enabled: true
 
 # API GatewayのURLを出力
