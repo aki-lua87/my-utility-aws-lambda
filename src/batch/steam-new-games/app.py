@@ -4,6 +4,7 @@
 初回実行時（DynamoDB空）は既存ゲームを全件保存するのみで通知はしない。
 """
 
+import html
 import json
 import logging
 import os
@@ -21,7 +22,9 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource("dynamodb")
 table_name = os.environ.get("TABLE_NAME", "aki-utils-dev")
 table = dynamodb.Table(table_name)
+bedrock = boto3.client("bedrock-runtime", region_name="ap-northeast-1")
 webhook_url = os.environ.get("STEAM_NEW_GAMES_WEBHOOK_URL", "")
+bedrock_analysis_enabled = os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false").lower() == "true"
 
 P_KEY = "steam_new_games"
 S_KEY_PREFIX = "appid_"
@@ -38,6 +41,12 @@ SEARCH_URL = (
     "&json=1"
 )
 
+APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
+APPREVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
+BEDROCK_MODEL_ID = "apac.amazon.nova-pro-v1:0"
+# 1回の実行で分析する新着ゲーム数に上限を設ける（コスト急増防止）
+MAX_BEDROCK_ANALYSIS_PER_RUN = int(os.environ.get("MAX_BEDROCK_ANALYSIS_PER_RUN", "10"))
+
 
 def extract_appid(logo_url: str) -> str | None:
     """カプセル画像URLからSteam App IDを抽出する。
@@ -45,6 +54,19 @@ def extract_appid(logo_url: str) -> str | None:
     """
     match = re.search(r"/apps/(\d+)/", logo_url)
     return match.group(1) if match else None
+
+
+def extract_json_object(text: str) -> str:
+    """モデル出力からJSONオブジェクト部分を取り出す（```json フェンス等を除去）。"""
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    return match.group(0) if match else text
+
+
+def strip_html(text: str) -> str:
+    """HTMLタグを除去し、HTMLエンティティをデコードして整形する。"""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -69,9 +91,12 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         new_items = filter_new_items(items)
         logger.info(f"Found {len(new_items)} new games")
 
-        for item in new_items:
+        for i, item in enumerate(new_items):
+            details = fetch_app_details(item["appid"])
+            reviews = fetch_app_reviews(item["appid"])
+            analysis = analyze_with_bedrock(item["name"], details, reviews) if i < MAX_BEDROCK_ANALYSIS_PER_RUN else None
             save_item(item)
-            post_to_discord(item)
+            post_to_discord(item, details, reviews, analysis)
 
         return {
             "statusCode": 200,
@@ -104,6 +129,122 @@ def fetch_search_results() -> list[dict]:
         logger.info(f"  fetched: appid={appid} name={name!r}")
 
     return items
+
+
+def fetch_app_details(appid: str) -> dict[str, Any] | None:
+    """Steam Store APIからゲームの概要・カテゴリ・ジャンルを取得する。"""
+    try:
+        response = requests.get(
+            APPDETAILS_URL,
+            params={"appids": appid, "l": "japanese", "cc": "jp"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        entry = response.json().get(appid, {})
+        if not entry.get("success"):
+            return None
+
+        data = entry.get("data", {})
+        about = data.get("short_description") or data.get("about_the_game", "")
+        return {
+            "about": strip_html(about),
+            "categories": [c.get("description", "") for c in data.get("categories", [])],
+            "genres": [g.get("description", "") for g in data.get("genres", [])],
+        }
+    except Exception as e:
+        logger.warning(f"appdetails取得に失敗しました (appid={appid}): {e}")
+        return None
+
+
+def fetch_app_reviews(appid: str) -> dict[str, Any] | None:
+    """Steam appreviews APIからレビュー概況と新着レビュー数件を取得する。"""
+    try:
+        response = requests.get(
+            APPREVIEWS_URL.format(appid=appid),
+            params={
+                "json": 1,
+                "language": "japanese",
+                "filter": "recent",
+                "num_per_page": 5,
+                "purchase_type": "all",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        summary = data.get("query_summary", {})
+        if data.get("success") != 1 or not summary.get("total_reviews"):
+            return None
+
+        samples = [strip_html(r["review"])[:300] for r in data.get("reviews", []) if r.get("review")]
+        return {
+            "review_score_desc": summary.get("review_score_desc", ""),
+            "total_positive": summary.get("total_positive", 0),
+            "total_negative": summary.get("total_negative", 0),
+            "samples": samples[:3],
+        }
+    except Exception as e:
+        logger.warning(f"レビュー取得に失敗しました (appid={appid}): {e}")
+        return None
+
+
+def analyze_with_bedrock(name: str, details: dict[str, Any] | None, reviews: dict[str, Any] | None) -> dict[str, str] | None:
+    """ゲーム概要・レビューをもとにBedrock(Claude)で評価コメントを生成する。"""
+    if not bedrock_analysis_enabled:
+        return None
+
+    try:
+        about = (details or {}).get("about", "")
+        categories = (details or {}).get("categories", [])
+        genres = (details or {}).get("genres", [])
+
+        review_section = ""
+        if reviews:
+            samples_text = "\n".join(f"- {s}" for s in reviews["samples"])
+            review_section = (
+                "\n\n# レビュー\n"
+                f"評価: {reviews['review_score_desc']}"
+                f"（賛成 {reviews['total_positive']} / 不評 {reviews['total_negative']}）\n"
+                f"{samples_text}"
+            )
+
+        prompt = f"""あなたはSteamの新着ゲームを紹介するアシスタントです。以下の情報を読んで、日本語で簡潔に分析してください。
+レビューがある場合は、その内容（プレイヤーの実際の感想）を評価の根拠として重視してください。
+
+# タイトル
+{name}
+
+# 概要
+{about or "(概要情報なし)"}
+
+# カテゴリ
+{", ".join(categories) or "不明"}
+
+# ジャンル
+{", ".join(genres) or "不明"}{review_section}
+
+以下のJSON形式で出力してください（説明文や```は不要、JSONのみ）:
+{{
+  "single_play": "シングルプレイでの実況に向いているか。レビューに言及があれば触れること（100文字程度）",
+  "multi_play": "マルチプレイ可能な場合、3〜4人で盛り上がるプレイができるか。レビューに言及があれば触れること。マルチプレイ非対応の場合はその旨を記載（100文字程度）",
+  "session_length": "1回の配信・実況セッションにどれくらいの時間/雰囲気が向いているか（さくっと短時間、じっくり長時間など）（100文字程度）"
+}}"""
+
+        response = bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 512},
+        )
+        text = response["output"]["message"]["content"][0]["text"]
+        analysis = json.loads(extract_json_object(text))
+        return {
+            "single_play": str(analysis.get("single_play", "")).strip()[:200] or "情報なし",
+            "multi_play": str(analysis.get("multi_play", "")).strip()[:200] or "情報なし",
+            "session_length": str(analysis.get("session_length", "")).strip()[:200] or "情報なし",
+        }
+    except Exception as e:
+        logger.error(f"Bedrock analysis failed (name={name}): {e}", exc_info=True)
+        return None
 
 
 def is_initial_run() -> bool:
@@ -168,7 +309,12 @@ def _build_record(item: dict) -> dict:
     }
 
 
-def post_to_discord(item: dict) -> None:
+def post_to_discord(
+    item: dict,
+    details: dict[str, Any] | None = None,
+    reviews: dict[str, Any] | None = None,
+    analysis: dict[str, str] | None = None,
+) -> None:
     """新着ゲームをDiscord webhookへ投稿する。"""
     if not webhook_url:
         logger.warning("Webhook URLが設定されていません、通知をスキップします")
@@ -187,11 +333,30 @@ def post_to_discord(item: dict) -> None:
     }
     if logo:
         embed["thumbnail"] = {"url": logo}
+    if details and details.get("about"):
+        embed["description"] = details["about"][:300]
+    if reviews:
+        review_text = f"{reviews['review_score_desc']}（賛成 {reviews['total_positive']} / 不評 {reviews['total_negative']}）"
+        embed["fields"] = [{"name": "レビュー", "value": review_text, "inline": False}]
+
+    embeds = [embed]
+    if analysis:
+        embeds.append(
+            {
+                "title": "AI評価",
+                "color": 0x57F287,  # Discordグリーン
+                "fields": [
+                    {"name": "シングル実況向き度", "value": analysis["single_play"], "inline": False},
+                    {"name": "マルチプレイ(3-4人)", "value": analysis["multi_play"], "inline": False},
+                    {"name": "配信時間の目安", "value": analysis["session_length"], "inline": False},
+                ],
+            }
+        )
 
     payload = {
         "username": "クソゲー発掘まるめし",
         # "avatar_url": "https://store.steampowered.com/favicon.ico",
-        "embeds": [embed],
+        "embeds": embeds,
     }
     response = requests.post(webhook_url, json=payload, timeout=10)
     response.raise_for_status()

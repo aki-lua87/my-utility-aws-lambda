@@ -38,6 +38,7 @@ bedrock_analysis_enabled = os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false").l
 P_KEY = "xzy_rank"
 S_KEY = "latest_list_id"
 S_KEY_NEWS = "latest_news_id"
+S_KEY_ANALYSIS = "latest_analysis"
 API_BASE_URL = "https://xzy.shengtiangames.com/mini-game/xzy/battle-record/hot-rank"
 NEWS_BASE_URL = "https://xzyjp.shengtiangames.com/newsInfo"
 DEFAULT_LIST_ID = 106  # Starting list_id
@@ -46,7 +47,9 @@ MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search for ranking
 NEWS_MAX_INCREMENT = 15  # Maximum forward increments to find latest news ID
 NEWS_SEARCH_DAYS = 7  # Days of patch notes to collect for analysis
 IMAGE_CACHE_PREFIX = "images/"  # S3 key prefix for cached images
-BEDROCK_MODEL_ID = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "jp.anthropic.claude-haiku-4-5-20251001-v1:0")
+BEDROCK_MAX_TOKENS = 2000  # Budget large enough to finish within ANALYSIS_CHAR_LIMIT without cutting off
+ANALYSIS_CHAR_LIMIT = 3000  # Keep analysis within Discord's 4096-char embed description limit
 
 # Hiragana + Katakana unicode ranges for Japanese detection
 JAPANESE_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
@@ -111,14 +114,13 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         save_last_news_id(latest_news_id)
         logger.info(f"[{time.time() - t0:.2f}s] fetch_recent_patch_notes: {len(patch_notes)} patch notes, latest_news_id={latest_news_id}")
 
-        # Bedrock analysis (find previous list_ids with different data, up to 5 decrements each)
+        # Bedrock analysis (find previous list_id with different data, up to 5 decrements)
         analysis = None
         if bedrock_analysis_enabled:
             t0 = time.time()
             current_shrunk = shrink_ranking_data(latest_data)
             previous_data = None
             prev_list_id = None
-            two_weeks_ago_data = None
 
             # Find previous week data (先週)
             for decrement in range(1, 6):
@@ -135,28 +137,15 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     break
                 logger.info(f"list_id {candidate_id} is identical to current, trying next...")
 
-            # Find two weeks ago data (先々週)
-            if previous_data and prev_list_id:
-                prev_shrunk = shrink_ranking_data(previous_data)
-                for decrement in range(1, 6):
-                    candidate_id = prev_list_id - decrement
-                    prev2_response = fetch_ranking_data(candidate_id)
-                    if not prev2_response or prev2_response.get("code") != 0 or not prev2_response.get("data"):
-                        logger.warning(f"Could not fetch two_weeks_ago data for list_id {candidate_id}, stopping search")
-                        break
-                    candidate_shrunk = shrink_ranking_data(prev2_response["data"])
-                    if candidate_shrunk != prev_shrunk:
-                        two_weeks_ago_data = prev2_response["data"]
-                        logger.info(f"Found two weeks ago data at list_id {candidate_id} (decrement={decrement})")
-                        break
-                    logger.info(f"list_id {candidate_id} is identical to previous week, trying next...")
-
             if previous_data:
-                analysis = analyze_with_bedrock(latest_data, previous_data, two_weeks_ago_data, patch_notes or None)
+                previous_analysis = get_last_analysis()
+                analysis = analyze_with_bedrock(latest_data, previous_data, patch_notes or None, previous_analysis)
                 logger.info(
                     f"[{time.time() - t0:.2f}s] bedrock analysis"
-                    f" (list_id {latest_list_id} vs {prev_list_id}" + (", two_weeks_ago included" if two_weeks_ago_data else "") + (f", {len(patch_notes)} patch notes" if patch_notes else "") + ")"
+                    f" (list_id {latest_list_id} vs {prev_list_id}" + (f", {len(patch_notes)} patch notes" if patch_notes else "") + (", with previous analysis" if previous_analysis else "") + ")"
                 )
+                if analysis:
+                    save_last_analysis(analysis)
             else:
                 logger.warning("No different previous data found within 5 decrements, skipping analysis")
 
@@ -263,6 +252,43 @@ def save_last_news_id(news_id: int) -> None:
         logger.info(f"Saved news_id to DynamoDB: {news_id}")
     except Exception as e:
         logger.error(f"Error saving news_id to DynamoDB: {e}", exc_info=True)
+        raise
+
+
+def get_last_analysis() -> str | None:
+    """Get the previous Bedrock analysis text from DynamoDB.
+
+    Returns:
+        Previous analysis text, or None if not previously stored
+    """
+    try:
+        response = table.get_item(Key={"p_key": P_KEY, "s_key": S_KEY_ANALYSIS})
+        if "Item" in response:
+            return response["Item"].get("analysis")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching previous analysis from DynamoDB: {e}", exc_info=True)
+        return None
+
+
+def save_last_analysis(analysis: str) -> None:
+    """Save the latest Bedrock analysis text to DynamoDB.
+
+    Args:
+        analysis: The analysis text to save
+    """
+    try:
+        table.put_item(
+            Item={
+                "p_key": P_KEY,
+                "s_key": S_KEY_ANALYSIS,
+                "analysis": analysis,
+                "updated_at": datetime.now().isoformat(),
+            }
+        )
+        logger.info(f"Saved analysis to DynamoDB: {len(analysis)} chars")
+    except Exception as e:
+        logger.error(f"Error saving analysis to DynamoDB: {e}", exc_info=True)
         raise
 
 
@@ -597,16 +623,16 @@ def shrink_ranking_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def analyze_with_bedrock(
     current_data: list[dict[str, Any]],
     previous_data: list[dict[str, Any]],
-    two_weeks_ago_data: list[dict[str, Any]] | None = None,
     patch_notes: list[dict[str, Any]] | None = None,
+    previous_analysis: str | None = None,
 ) -> str | None:
-    """Analyze ranking changes using Amazon Bedrock (Claude).
+    """Analyze ranking changes using Amazon Bedrock.
 
     Args:
         current_data: Current week's ranking data
         previous_data: Previous week's ranking data
-        two_weeks_ago_data: Two weeks ago ranking data (optional)
         patch_notes: Japanese patch note articles from the past week (optional)
+        previous_analysis: Last week's analysis text, for continuity (optional)
 
     Returns:
         Analysis text or None if disabled/failed
@@ -626,59 +652,42 @@ def analyze_with_bedrock(
             notes_text = "\n\n".join(f"### {note['title']} ({note['date'].strftime('%Y-%m-%d')})\n" + "\n".join(note["content"].splitlines()[:40]) for note in patch_notes)
             patch_notes_section = f"\n\n# 直近1週間のキャラクター調整情報\n{notes_text}"
 
-        if two_weeks_ago_data:
-            two_weeks_ago_summary = shrink_ranking_data(two_weeks_ago_data)
-            logger.info(f"two_weeks_ago_summary: {two_weeks_ago_summary}")
-            prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
-過去3週分のランキングデータを比較して、日本語で簡潔に分析してください。
+        # Build previous analysis section if available (for continuity across weeks)
+        previous_analysis_section = ""
+        if previous_analysis:
+            previous_analysis_section = f"\n\n# 前回（先週）の分析結果\n{previous_analysis}"
 
-# 先々週のランキング（出場率順）
-{json.dumps(two_weeks_ago_summary, ensure_ascii=False, indent=2)}
-
-# 先週のランキング（出場率順）
-{json.dumps(previous_summary, ensure_ascii=False, indent=2)}
-
-# 今週のランキング（出場率順）
-{json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}
-
-以下の観点で分析してください：
-- 出場率・勝率・BAN率が大きく変動したキャラ（特に今週の変化）
-- 先々週からの中期的なトレンド（継続して上昇・下降しているキャラ）
-- 新たに注目されたキャラや評価が下がったキャラ
-- 直近のアップデートによる調整がランキングに与えた影響（調整情報がある場合）
-- 今週の環境のポイント（2〜3行程度のサマリー）
-
-600文字以内でまとめてください。"""
-        else:
-            prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
-先週と今週のランキングデータを比較して、日本語で簡潔に分析してください。
+        prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
+先週と今週のランキングデータを比較して、日本語で分析してください。
 
 # 先週のランキング（出場率順）
 {json.dumps(previous_summary, ensure_ascii=False, indent=2)}
 
 # 今週のランキング（出場率順）
-{json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}
+{json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}{previous_analysis_section}
 
-以下の観点で分析してください：
-- 出場率・勝率・BAN率が大きく変動したキャラ
-- 新たに注目されたキャラや評価が下がったキャラ
-- 直近のアップデートによる調整がランキングに与えた影響（調整情報がある場合）
-- 今週の環境のポイント（2〜3行程度のサマリー）
+以下の4項目の見出しで分析してください。キャラクター調整情報がある場合は、それぞれの調整が上方修正（強化）か下方修正（弱体化）かを判断し、ランキングへの影響を該当する項目で触れてください。前回の分析結果がある場合は、前回指摘した傾向が今週どうなったかを参考にしつつ、関連する項目で簡潔に触れてください（無理に触れる必要はありません）。
 
-500文字以内でまとめてください。"""
+## 新キャラ評価
+今週新たにランキングに登場したキャラクター（先週のランキングに存在しないキャラ）がいる場合のみ、その性能（勝率・出場率・BAN率）を評価してください。いない場合はこの項目（見出しを含む）自体を出力しないでください。
 
-        response = bedrock.invoke_model(
+## 環境上位キャラ評価
+出場率が今週上位4体のキャラクターについて、強さの理由や採用率の高さ、先週からの変化を評価してください。
+
+## その他の評価変動キャラ
+上位4体以外で、出場率・勝率・BAN率が先週から大きく変動した（上昇または下降した）キャラクターがいる場合、その変化と考えられる要因を述べてください。いない場合は「特になし」と記載してください。
+
+## 全体サマリ
+今週の環境全体の傾向を2〜3行でまとめてください。
+
+全体で{ANALYSIS_CHAR_LIMIT}文字以内に収め、各項目は簡潔に、文章を最後まで書き切ってください。"""
+
+        response = bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
-            body=json.dumps(
-                {
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 512,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-            ),
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": BEDROCK_MAX_TOKENS},
         )
-        result = json.loads(response["body"].read())
-        analysis = result["content"][0]["text"]
+        analysis = response["output"]["message"]["content"][0]["text"]
         logger.info(f"Bedrock analysis completed: {len(analysis)} chars")
         return analysis
 
@@ -720,14 +729,15 @@ def post_to_discord(
             encoded.append((filename, buf))
         logger.info(f"[{time.time() - t0:.2f}s] encode {len(encoded)} images")
 
-        # Build content text
+        # Build content text (analysis goes in an embed to avoid the 2000-char content limit)
         content = "今週の 2v2 キャラランキング (6000-8000帯)"
-        if analysis:
-            content += f"\n\n{analysis}"
 
         # Attach all images in a single Discord message (max 10 files)
         files = {f"files[{i}]": (filename, buf, "image/png") for i, (filename, buf) in enumerate(encoded)}
-        payload = {"content": content}
+        payload: dict[str, Any] = {"content": content}
+        if analysis:
+            # Discord embed description limit: 4096 chars
+            payload["embeds"] = [{"description": analysis[:4096], "color": 0x5865F2}]
 
         t0 = time.time()
         response = requests.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files, timeout=60)
