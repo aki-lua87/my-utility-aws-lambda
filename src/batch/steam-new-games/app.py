@@ -157,31 +157,60 @@ def fetch_app_details(appid: str) -> dict[str, Any] | None:
 
 
 def fetch_app_reviews(appid: str) -> dict[str, Any] | None:
-    """Steam appreviews APIからレビュー概況と新着レビュー数件を取得する。"""
+    """Steam appreviews APIからレビュー概況と不評・好評レビューを取得する。
+    ネガティブレビューを先に3件、次にポジティブレビューを2件取得する。
+    """
     try:
-        response = requests.get(
+        neg_response = requests.get(
             APPREVIEWS_URL.format(appid=appid),
             params={
                 "json": 1,
                 "language": "japanese",
-                "filter": "recent",
-                "num_per_page": 5,
+                "filter": "all",
+                "review_type": "negative",
+                "num_per_page": 3,
                 "purchase_type": "all",
             },
             timeout=10,
         )
-        response.raise_for_status()
-        data = response.json()
-        summary = data.get("query_summary", {})
-        if data.get("success") != 1 or not summary.get("total_reviews"):
+        neg_response.raise_for_status()
+        neg_data = neg_response.json()
+        summary = neg_data.get("query_summary", {})
+        if neg_data.get("success") != 1 or not summary.get("total_reviews"):
             return None
 
-        samples = [strip_html(r["review"])[:300] for r in data.get("reviews", []) if r.get("review")]
+        negative_samples = [
+            strip_html(r["review"])[:300]
+            for r in neg_data.get("reviews", [])
+            if r.get("review")
+        ][:3]
+
+        pos_response = requests.get(
+            APPREVIEWS_URL.format(appid=appid),
+            params={
+                "json": 1,
+                "language": "japanese",
+                "filter": "all",
+                "review_type": "positive",
+                "num_per_page": 2,
+                "purchase_type": "all",
+            },
+            timeout=10,
+        )
+        pos_response.raise_for_status()
+        pos_data = pos_response.json()
+        positive_samples = [
+            strip_html(r["review"])[:300]
+            for r in pos_data.get("reviews", [])
+            if r.get("review")
+        ][:2]
+
         return {
             "review_score_desc": summary.get("review_score_desc", ""),
             "total_positive": summary.get("total_positive", 0),
             "total_negative": summary.get("total_negative", 0),
-            "samples": samples[:3],
+            "negative_samples": negative_samples,
+            "positive_samples": positive_samples,
         }
     except Exception as e:
         logger.warning(f"レビュー取得に失敗しました (appid={appid}): {e}")
@@ -200,16 +229,21 @@ def analyze_with_bedrock(name: str, details: dict[str, Any] | None, reviews: dic
 
         review_section = ""
         if reviews:
-            samples_text = "\n".join(f"- {s}" for s in reviews["samples"])
             review_section = (
                 "\n\n# レビュー\n"
                 f"評価: {reviews['review_score_desc']}"
                 f"（賛成 {reviews['total_positive']} / 不評 {reviews['total_negative']}）\n"
-                f"{samples_text}"
             )
+            if reviews.get("negative_samples"):
+                neg_text = "\n".join(f"  - {s}" for s in reviews["negative_samples"])
+                review_section += f"## 不評レビュー\n{neg_text}\n"
+            if reviews.get("positive_samples"):
+                pos_text = "\n".join(f"  - {s}" for s in reviews["positive_samples"])
+                review_section += f"## 好評レビュー\n{pos_text}\n"
 
         prompt = f"""あなたはSteamの新着ゲームを紹介するアシスタントです。以下の情報を読んで、日本語で簡潔に分析してください。
 レビューがある場合は、その内容（プレイヤーの実際の感想）を評価の根拠として重視してください。
+特に不評レビューに注目し、問題点や欠点を正直に伝えてください。
 
 # タイトル
 {name}
@@ -225,9 +259,8 @@ def analyze_with_bedrock(name: str, details: dict[str, Any] | None, reviews: dic
 
 以下のJSON形式で出力してください（説明文や```は不要、JSONのみ）:
 {{
-  "single_play": "シングルプレイでの実況に向いているか。レビューに言及があれば触れること（100文字程度）",
-  "multi_play": "マルチプレイ可能な場合、3〜4人で盛り上がるプレイができるか。レビューに言及があれば触れること。マルチプレイ非対応の場合はその旨を記載（100文字程度）",
-  "session_length": "1回の配信・実況セッションにどれくらいの時間/雰囲気が向いているか（さくっと短時間、じっくり長時間など）（100文字程度）"
+  "multi_play": "マルチプレイ対応かどうかを明記し、対応の場合は3〜4人プレイの可否も記載。レビューに言及があれば触れること（50文字程度）",
+  "session_length": "1回の配信・実況セッションにどれくらいの時間/雰囲気が向いているか。不評レビューで指摘された問題点があれば触れること（100文字程度）"
 }}"""
 
         response = bedrock.converse(
@@ -238,7 +271,6 @@ def analyze_with_bedrock(name: str, details: dict[str, Any] | None, reviews: dic
         text = response["output"]["message"]["content"][0]["text"]
         analysis = json.loads(extract_json_object(text))
         return {
-            "single_play": str(analysis.get("single_play", "")).strip()[:200] or "情報なし",
             "multi_play": str(analysis.get("multi_play", "")).strip()[:200] or "情報なし",
             "session_length": str(analysis.get("session_length", "")).strip()[:200] or "情報なし",
         }
@@ -346,8 +378,7 @@ def post_to_discord(
                 "title": "AI評価",
                 "color": 0x57F287,  # Discordグリーン
                 "fields": [
-                    {"name": "シングル実況向き度", "value": analysis["single_play"], "inline": False},
-                    {"name": "マルチプレイ(3-4人)", "value": analysis["multi_play"], "inline": False},
+                    {"name": "マルチプレイ対応", "value": analysis["multi_play"], "inline": False},
                     {"name": "配信時間の目安", "value": analysis["session_length"], "inline": False},
                 ],
             }
