@@ -59,3 +59,7 @@ run = "sam local invoke XzyRankFunction --parameter-overrides XzyWebHookUrl=\"$X
 [tasks.xzy-rank-image]
 description = "Generate XZY ranking images locally"
 run = "python src/batch/xzy-rank/test_local.py"
+
+[tasks.xzy-rank-refresh-images]
+description = "Refresh XZY character image cache locally (saves PNGs to test_output/, no AWS needed)"
+run = "python src/batch/xzy-rank-refresh-images/test_local.py"

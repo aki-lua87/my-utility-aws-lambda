@@ -164,6 +164,25 @@ Resources:
             Description: Weekly XZY ranking data fetch every Thursday at 1 AM JST
             Enabled: true
 
+  XzyRankRefreshImagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/xzy-rank-refresh-images/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+          IMAGE_CACHE_BUCKET: !Ref XzyRankImageCacheBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AkiUtilsTable
+        - S3CrudPolicy:
+            BucketName: !Ref XzyRankImageCacheBucket
+      # Manual invocation only (sam local invoke / AWS console / CLI) — no schedule trigger.
+      # Use this to force-refresh the character image cache when a bad image got cached,
+      # without waiting for the next weekly XzyRankFunction run.
+
   SteamNewGamesFunction:
     Type: AWS::Serverless::Function
     Properties:

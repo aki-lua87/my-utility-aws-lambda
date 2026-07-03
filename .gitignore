@@ -70,3 +70,4 @@ htmlcov/
 # Test output images
 test_output_*.png
 src/batch/xzy-rank/fonts/NotoSansJP-Regular.ttf
+src/batch/xzy-rank-refresh-images/test_output/
