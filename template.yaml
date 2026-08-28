@@ -208,7 +208,7 @@ Resources:
           Properties:
             Schedule: cron(0 4 * * ? *) # Daily at 12:00 JST
             Description: Daily Steam new games check
-            Enabled: true
+            Enabled: false
 
   AwsCostDailyFunction:
     Type: AWS::Serverless::Function
