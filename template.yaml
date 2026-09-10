@@ -138,14 +138,16 @@ Resources:
     Properties:
       CodeUri: src/batch/xzy-rank/
       Handler: app.lambda_handler
-      Timeout: 120
+      Timeout: 300
       Environment:
         Variables:
           TABLE_NAME: !Ref AkiUtilsTable
           XZY_WEBHOOK_URL: !Ref XzyWebHookUrl
           IMAGE_CACHE_BUCKET: !Ref XzyRankImageCacheBucket
-          BEDROCK_ANALYSIS_ENABLED: "true"
-          # BEDROCK_MODEL_ID: "apac.amazon.nova-pro-v1:0"
+          ANALYSIS_ENABLED: "true"
+          # Use Claude Sonnet 4.6 as the sole ranking analysis model.
+          ANALYSIS_MODELS: >-
+            [{"key":"claude-sonnet-4-6","display_name":"Claude Sonnet 4.6","model_id":"jp.anthropic.claude-sonnet-4-6"}]
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AkiUtilsTable

@@ -32,13 +32,13 @@ table = dynamodb.Table(table_name)
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime", region_name="ap-northeast-1")
 image_cache_bucket = os.environ.get("IMAGE_CACHE_BUCKET", "")
-bedrock_analysis_enabled = os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false").lower() == "true"
+analysis_enabled = os.environ.get("ANALYSIS_ENABLED", os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false")).lower() == "true"
 
 # Constants
 P_KEY = "xzy_rank"
 S_KEY = "latest_list_id"
 S_KEY_NEWS = "latest_news_id"
-S_KEY_ANALYSIS = "latest_analysis"
+S_KEY_ANALYSIS = "latest_analysis"  # Analysis history sort-key prefix
 API_BASE_URL = "https://xzy.shengtiangames.com/mini-game/xzy/battle-record/hot-rank"
 NEWS_BASE_URL = "https://xzyjp.shengtiangames.com/newsInfo"
 DEFAULT_LIST_ID = 106  # Starting list_id
@@ -47,9 +47,15 @@ MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search for ranking
 NEWS_MAX_INCREMENT = 15  # Maximum forward increments to find latest news ID
 NEWS_SEARCH_DAYS = 7  # Days of patch notes to collect for analysis
 IMAGE_CACHE_PREFIX = "images/"  # S3 key prefix for cached images
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "jp.anthropic.claude-haiku-4-5-20251001-v1:0")
 BEDROCK_MAX_TOKENS = 2000  # Budget large enough to finish within ANALYSIS_CHAR_LIMIT without cutting off
 ANALYSIS_CHAR_LIMIT = 3000  # Keep analysis within Discord's 4096-char embed description limit
+DEFAULT_ANALYSIS_MODELS = [
+    {
+        "key": "claude-sonnet-4-6",
+        "display_name": "Claude Sonnet 4.6",
+        "model_id": "jp.anthropic.claude-sonnet-4-6",
+    },
+]
 
 # Hiragana + Katakana unicode ranges for Japanese detection
 JAPANESE_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
@@ -106,7 +112,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         save_last_list_id(latest_list_id)
         logger.info(f"[{time.time() - t0:.2f}s] save_last_list_id")
 
-        # Fetch patch notes from the past week (run regardless of bedrock_analysis_enabled
+        # Fetch patch notes from the past week (run regardless of analysis_enabled
         # so the latest news_id is always kept up to date in DynamoDB)
         t0 = time.time()
         last_news_id = get_last_news_id()
@@ -114,9 +120,16 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         save_last_news_id(latest_news_id)
         logger.info(f"[{time.time() - t0:.2f}s] fetch_recent_patch_notes: {len(patch_notes)} patch notes, latest_news_id={latest_news_id}")
 
-        # Bedrock analysis (find previous list_id with different data, up to 5 decrements)
-        analysis = None
-        if bedrock_analysis_enabled:
+        # Post ranking images first so Discord ordering is deterministic even when
+        # one of the model calls is slow or fails.
+        t0 = time.time()
+        post_images_to_discord(latest_data, latest_list_id, webhook_url)
+        logger.info(f"[{time.time() - t0:.2f}s] post_images_to_discord")
+
+        # Multi-model Bedrock analysis (find previous list_id with different data,
+        # up to 5 decrements).
+        analysis_results: list[dict[str, Any]] = []
+        if analysis_enabled:
             t0 = time.time()
             current_shrunk = shrink_ranking_data(latest_data)
             previous_data = None
@@ -137,22 +150,32 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     break
                 logger.info(f"list_id {candidate_id} is identical to current, trying next...")
 
-            if previous_data:
-                previous_analysis = get_last_analysis()
-                analysis = analyze_with_bedrock(latest_data, previous_data, patch_notes or None, previous_analysis)
-                logger.info(
-                    f"[{time.time() - t0:.2f}s] bedrock analysis"
-                    f" (list_id {latest_list_id} vs {prev_list_id}" + (f", {len(patch_notes)} patch notes" if patch_notes else "") + (", with previous analysis" if previous_analysis else "") + ")"
+            if previous_data and prev_list_id is not None:
+                models = load_analysis_models()
+                analysis_results = analyze_with_models(
+                    models,
+                    latest_data,
+                    previous_data,
+                    prev_list_id,
+                    patch_notes or None,
                 )
-                if analysis:
-                    save_last_analysis(analysis)
+                logger.info(
+                    f"[{time.time() - t0:.2f}s] multi-model Bedrock analysis"
+                    f" (list_id {latest_list_id} vs {prev_list_id}, models={len(models)}" + (f", {len(patch_notes)} patch notes" if patch_notes else "") + ")"
+                )
+
+                for result in analysis_results:
+                    if result["analysis"]:
+                        save_last_analysis(
+                            result["model"],
+                            latest_list_id,
+                            prev_list_id,
+                            result["analysis"],
+                        )
+
+                post_analysis_results_to_discord(webhook_url, analysis_results)
             else:
                 logger.warning("No different previous data found within 5 decrements, skipping analysis")
-
-        # Post to Discord
-        t0 = time.time()
-        post_to_discord(latest_data, latest_list_id, webhook_url, analysis)
-        logger.info(f"[{time.time() - t0:.2f}s] post_to_discord")
 
         logger.info(f"[{time.time() - t_start:.2f}s] total: Successfully completed XZY ranking data fetch")
         return {
@@ -162,6 +185,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     "message": "Successfully processed XZY ranking data",
                     "list_id": latest_list_id,
                     "data_count": len(latest_data),
+                    "analysis_models": [result["model"]["display_name"] for result in analysis_results],
                 }
             ),
         }
@@ -255,41 +279,69 @@ def save_last_news_id(news_id: int) -> None:
         raise
 
 
-def get_last_analysis() -> str | None:
-    """Get the previous Bedrock analysis text from DynamoDB.
+def _analysis_sort_key(model_key: str, list_id: int) -> str:
+    """Return the immutable model/list-specific analysis history key."""
+    return f"{S_KEY_ANALYSIS}#{model_key}#{list_id:012d}"
+
+
+def get_last_analysis(model: dict[str, Any], list_id: int) -> str | None:
+    """Get one model's analysis for the exact comparison list ID.
 
     Returns:
-        Previous analysis text, or None if not previously stored
+        Analysis text for ``list_id``, or None if it has not been stored
     """
     try:
-        response = table.get_item(Key={"p_key": P_KEY, "s_key": S_KEY_ANALYSIS})
+        response = table.get_item(
+            Key={"p_key": P_KEY, "s_key": _analysis_sort_key(model["key"], list_id)}
+        )
         if "Item" in response:
             return response["Item"].get("analysis")
         return None
     except Exception as e:
-        logger.error(f"Error fetching previous analysis from DynamoDB: {e}", exc_info=True)
+        logger.error(
+            f"Error fetching analysis for {model['key']} list_id={list_id} from DynamoDB: {e}",
+            exc_info=True,
+        )
         return None
 
 
-def save_last_analysis(analysis: str) -> None:
-    """Save the latest Bedrock analysis text to DynamoDB.
+def save_last_analysis(
+    model: dict[str, Any],
+    list_id: int,
+    compared_list_id: int,
+    analysis: str,
+) -> None:
+    """Save analysis history for one model and ranking list ID.
 
     Args:
+        model: Model configuration
+        list_id: Ranking list ID analyzed as the current data
+        compared_list_id: Ranking list ID used as the previous data
         analysis: The analysis text to save
     """
     try:
         table.put_item(
             Item={
                 "p_key": P_KEY,
-                "s_key": S_KEY_ANALYSIS,
+                "s_key": _analysis_sort_key(model["key"], list_id),
+                "model_key": model["key"],
+                "model_id": model["model_id"],
+                "model_name": model["display_name"],
+                "list_id": list_id,
+                "compared_list_id": compared_list_id,
                 "analysis": analysis,
                 "updated_at": datetime.now().isoformat(),
             }
         )
-        logger.info(f"Saved analysis to DynamoDB: {len(analysis)} chars")
+        logger.info(
+            f"Saved {model['display_name']} analysis to DynamoDB: "
+            f"list_id={list_id}, compared_list_id={compared_list_id}, {len(analysis)} chars"
+        )
     except Exception as e:
-        logger.error(f"Error saving analysis to DynamoDB: {e}", exc_info=True)
-        raise
+        logger.error(
+            f"Error saving {model['display_name']} analysis to DynamoDB: {e}",
+            exc_info=True,
+        )
 
 
 def fetch_news_article(news_id: int) -> dict[str, Any] | None:
@@ -620,44 +672,64 @@ def shrink_ranking_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def analyze_with_bedrock(
+def load_analysis_models() -> list[dict[str, Any]]:
+    """Load ordered model configuration from ANALYSIS_MODELS.
+
+    ANALYSIS_MODELS is a JSON array. Each item must contain a stable ``key``, a
+    Discord ``display_name``, and the Bedrock ``model_id``. Editing this one
+    setting is enough to add, remove, or reorder comparison models. Optional
+    ``additional_model_request_fields`` are passed through to Converse.
+    """
+    raw = os.environ.get("ANALYSIS_MODELS")
+    models = json.loads(raw) if raw else DEFAULT_ANALYSIS_MODELS
+    if not isinstance(models, list) or not models:
+        raise ValueError("ANALYSIS_MODELS must be a non-empty JSON array")
+
+    normalized: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for index, model in enumerate(models):
+        if not isinstance(model, dict):
+            raise ValueError(f"ANALYSIS_MODELS[{index}] must be an object")
+        normalized_model = {field: str(model.get(field, "")).strip() for field in ("key", "display_name", "model_id")}
+        missing = [field for field, value in normalized_model.items() if not value]
+        if missing:
+            raise ValueError(f"ANALYSIS_MODELS[{index}] is missing: {', '.join(missing)}")
+        if normalized_model["key"] in seen_keys:
+            raise ValueError(f"Duplicate ANALYSIS_MODELS key: {normalized_model['key']}")
+        additional_fields = model.get("additional_model_request_fields")
+        if additional_fields is not None:
+            if not isinstance(additional_fields, dict):
+                raise ValueError(
+                    f"ANALYSIS_MODELS[{index}].additional_model_request_fields must be an object"
+                )
+            normalized_model["additional_model_request_fields"] = additional_fields
+        seen_keys.add(normalized_model["key"])
+        normalized.append(normalized_model)
+    return normalized
+
+
+def build_analysis_prompt(
     current_data: list[dict[str, Any]],
     previous_data: list[dict[str, Any]],
     patch_notes: list[dict[str, Any]] | None = None,
     previous_analysis: str | None = None,
-) -> str | None:
-    """Analyze ranking changes using Amazon Bedrock.
+) -> str:
+    """Build the provider-neutral prompt shared by all comparison models."""
+    current_summary = shrink_ranking_data(current_data)
+    previous_summary = shrink_ranking_data(previous_data)
+    logger.info(f"current_summary: {current_summary}")
+    logger.info(f"previous_summary: {previous_summary}")
 
-    Args:
-        current_data: Current week's ranking data
-        previous_data: Previous week's ranking data
-        patch_notes: Japanese patch note articles from the past week (optional)
-        previous_analysis: Last week's analysis text, for continuity (optional)
+    patch_notes_section = ""
+    if patch_notes:
+        notes_text = "\n\n".join(f"### {note['title']} ({note['date'].strftime('%Y-%m-%d')})\n" + "\n".join(note["content"].splitlines()[:40]) for note in patch_notes)
+        patch_notes_section = f"\n\n# 直近1週間のキャラクター調整情報\n{notes_text}"
 
-    Returns:
-        Analysis text or None if disabled/failed
-    """
-    if not bedrock_analysis_enabled:
-        return None
+    previous_analysis_section = ""
+    if previous_analysis:
+        previous_analysis_section = f"\n\n# 前回（先週）の同一モデルによる分析結果\n{previous_analysis}"
 
-    try:
-        current_summary = shrink_ranking_data(current_data)
-        previous_summary = shrink_ranking_data(previous_data)
-        logger.info(f"current_summary: {current_summary}")
-        logger.info(f"previous_summary: {previous_summary}")
-
-        # Build patch notes section if available
-        patch_notes_section = ""
-        if patch_notes:
-            notes_text = "\n\n".join(f"### {note['title']} ({note['date'].strftime('%Y-%m-%d')})\n" + "\n".join(note["content"].splitlines()[:40]) for note in patch_notes)
-            patch_notes_section = f"\n\n# 直近1週間のキャラクター調整情報\n{notes_text}"
-
-        # Build previous analysis section if available (for continuity across weeks)
-        previous_analysis_section = ""
-        if previous_analysis:
-            previous_analysis_section = f"\n\n# 前回（先週）の分析結果\n{previous_analysis}"
-
-        prompt = f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
+    return f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
 先週と今週のランキングデータを比較して、日本語で分析してください。
 
 # 先週のランキング（出場率順）
@@ -666,7 +738,7 @@ def analyze_with_bedrock(
 # 今週のランキング（出場率順）
 {json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}{previous_analysis_section}
 
-以下の4項目の見出しで分析してください。キャラクター調整情報がある場合は、それぞれの調整が上方修正（強化）か下方修正（弱体化）かを判断し、ランキングへの影響を該当する項目で触れてください。前回の分析結果がある場合は、前回指摘した傾向が今週どうなったかを参考にしつつ、関連する項目で簡潔に触れてください（無理に触れる必要はありません）。
+以下の5項目の見出しで分析してください。キャラクター調整情報がある場合は、それぞれの調整が上方修正（強化）か下方修正（弱体化）かを判断し、ランキングへの影響を該当する項目で触れてください。前回の分析結果がある場合は、前回指摘した傾向が今週どうなったかを参考にしつつ、関連する項目で簡潔に触れてください（無理に触れる必要はありません）。同じキャラクターを複数の項目で重複して詳述せず、最も適した項目で評価してください。
 
 ## 新キャラ評価
 今週新たにランキングに登場したキャラクター（先週のランキングに存在しないキャラ）がいる場合のみ、その性能（勝率・出場率・BAN率）を評価してください。いない場合はこの項目（見出しを含む）自体を出力しないでください。
@@ -674,41 +746,116 @@ def analyze_with_bedrock(
 ## 環境上位キャラ評価
 出場率が1.1%未満のキャラクターは対象外とした上で、出場率が今週上位3体のキャラクターについて、強さの理由や採用率の高さ、先週からの変化を評価してください。
 
+## 高BAN率キャラ評価
+今週のBAN率が上位3体のキャラクターを候補とし、BAN率の高さが環境への影響力や対策の難しさを示しているキャラクターを最大2体まで評価してください。出場率が1.1%未満でも対象外にしないでください。先週からのBAN率の変化、勝率・出場率との関係も踏まえ、単に数値を並べるのではなくBANされやすいと考えられる理由を述べてください。該当するキャラクターがいない場合は「特になし」と記載してください。
+
 ## その他の評価変動キャラ
-出場率が1.1%未満のキャラクターは対象外とした上で、上位3体以外で、出場率・勝率・BAN率が先週から大きく変動した（上昇または下降した）キャラクターについて、変化と考えられる要因が大きい順に最大3体まで述べてください。該当するキャラクターがいない場合は「特になし」と記載してください。
+「環境上位キャラ評価」と「高BAN率キャラ評価」で取り上げたキャラクター以外から、出場率・勝率・BAN率が先週から大きく変動した（上昇または下降した）キャラクターについて、変化と考えられる要因が大きい順に最大3体まで述べてください。原則として出場率1.1%以上を対象としますが、BAN率が今週上位3体、またはBAN率の変動が特に大きいキャラクターは、出場率1.1%未満でも対象に含めてください。該当するキャラクターがいない場合は「特になし」と記載してください。
 
 ## 全体サマリ
 今週の環境全体の傾向を2〜3行でまとめてください。
 
 全体で{ANALYSIS_CHAR_LIMIT}文字以内に収め、各項目は簡潔に、文章を最後まで書き切ってください。"""
 
+
+def analyze_with_bedrock(
+    model: dict[str, Any],
+    current_data: list[dict[str, Any]],
+    previous_data: list[dict[str, Any]],
+    patch_notes: list[dict[str, Any]] | None = None,
+    previous_analysis: str | None = None,
+) -> str | None:
+    """Analyze ranking changes with one model through Bedrock Converse.
+
+    Args:
+        model: Model configuration
+        current_data: Current week's ranking data
+        previous_data: Previous week's ranking data
+        patch_notes: Japanese patch note articles from the past week (optional)
+        previous_analysis: Last week's analysis text, for continuity (optional)
+
+    Returns:
+        Analysis text or None if disabled/failed
+    """
+    if not analysis_enabled:
+        return None
+
+    try:
+        prompt = build_analysis_prompt(current_data, previous_data, patch_notes, previous_analysis)
+
+        converse_args = {
+            "modelId": model["model_id"],
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": {"maxTokens": BEDROCK_MAX_TOKENS},
+        }
+        if additional_fields := model.get("additional_model_request_fields"):
+            converse_args["additionalModelRequestFields"] = additional_fields
+
         response = bedrock.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": BEDROCK_MAX_TOKENS},
+            **converse_args,
         )
-        analysis = response["output"]["message"]["content"][0]["text"]
-        logger.info(f"Bedrock analysis completed: {len(analysis)} chars")
+        content = response["output"]["message"]["content"]
+        analysis = next((block["text"] for block in content if block.get("text")), None)
+        if not analysis:
+            raise ValueError("Bedrock response did not contain a text block")
+        logger.info(f"{model['display_name']} analysis completed: {len(analysis)} chars")
         return analysis
 
     except Exception as e:
-        logger.error(f"Bedrock analysis failed: {e}", exc_info=True)
+        logger.error(f"{model['display_name']} analysis failed: {e}", exc_info=True)
         return None
 
 
-def post_to_discord(
+def analyze_with_models(
+    models: list[dict[str, Any]],
+    current_data: list[dict[str, Any]],
+    previous_data: list[dict[str, Any]],
+    previous_list_id: int,
+    patch_notes: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Run independent model analyses concurrently and retain config order."""
+    previous_by_key = {
+        model["key"]: get_last_analysis(model, previous_list_id) for model in models
+    }
+    analyses_by_key: dict[str, str | None] = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(models), 4)) as executor:
+        futures = {
+            executor.submit(
+                analyze_with_bedrock,
+                model,
+                current_data,
+                previous_data,
+                patch_notes,
+                previous_by_key[model["key"]],
+            ): model
+            for model in models
+        }
+        for future in as_completed(futures):
+            model = futures[future]
+            try:
+                analyses_by_key[model["key"]] = future.result()
+            except Exception as e:
+                logger.error(
+                    f"Unexpected {model['display_name']} analysis error: {e}",
+                    exc_info=True,
+                )
+                analyses_by_key[model["key"]] = None
+
+    return [{"model": model, "analysis": analyses_by_key.get(model["key"])} for model in models]
+
+
+def post_images_to_discord(
     data: list[dict[str, Any]],
     list_id: int,
     webhook_url: str,
-    analysis: str | None = None,
 ) -> None:
-    """Post ranking data to Discord webhook with images.
+    """Post ranking images as the first Discord message.
 
     Args:
         data: Ranking data from API
         list_id: The list_id of the data
         webhook_url: Discord webhook URL
-        analysis: Optional Bedrock analysis text
     """
     try:
         # Sort by on_rate for image generation
@@ -729,15 +876,9 @@ def post_to_discord(
             encoded.append((filename, buf))
         logger.info(f"[{time.time() - t0:.2f}s] encode {len(encoded)} images")
 
-        # Build content text (analysis goes in an embed to avoid the 2000-char content limit)
-        content = "今週の 2v2 キャラランキング (6000-8000帯)"
-
         # Attach all images in a single Discord message (max 10 files)
         files = {f"files[{i}]": (filename, buf, "image/png") for i, (filename, buf) in enumerate(encoded)}
-        payload: dict[str, Any] = {"content": content}
-        if analysis:
-            # Discord embed description limit: 4096 chars
-            payload["embeds"] = [{"description": analysis[:4096], "color": 0x5865F2}]
+        payload: dict[str, Any] = {"content": "今週の 2v2 キャラランキング (6000-8000帯)"}
 
         t0 = time.time()
         response = requests.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files, timeout=60)
@@ -745,8 +886,37 @@ def post_to_discord(
         logger.info(f"[{time.time() - t0:.2f}s] posted {len(encoded)} images to Discord in single message")
 
     except Exception as e:
-        logger.error(f"Error posting to Discord: {e}", exc_info=True)
+        logger.error(f"Error posting images to Discord: {e}", exc_info=True)
         raise
+
+
+def post_analysis_results_to_discord(webhook_url: str, results: list[dict[str, Any]]) -> None:
+    """Post one ordered Discord message per model after the image message."""
+    for result in results:
+        model = result["model"]
+        analysis = result["analysis"]
+        if analysis:
+            heading = f"**{model['display_name']}**\n\n"
+            description = heading + analysis[: 4096 - len(heading)]
+            color = 0x5865F2
+        else:
+            description = f"**{model['display_name']}**\n\n解析に失敗しました。。。"
+            color = 0xED4245
+
+        payload = {
+            "embeds": [{"description": description, "color": color}],
+            "allowed_mentions": {"parse": []},
+        }
+        try:
+            response = requests.post(webhook_url, json=payload, timeout=20)
+            response.raise_for_status()
+            logger.info(f"Posted {model['display_name']} analysis to Discord")
+        except Exception as e:
+            # One model's Discord failure must not suppress the remaining results.
+            logger.error(
+                f"Failed to post {model['display_name']} analysis to Discord: {e}",
+                exc_info=True,
+            )
 
 
 def group_by_cost(data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
