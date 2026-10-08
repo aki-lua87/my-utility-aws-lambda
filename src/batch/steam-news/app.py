@@ -4,13 +4,14 @@ This function fetches Steam news from RSS feeds for configured app IDs,
 stores new news items in DynamoDB, and posts them to Discord.
 """
 
+import calendar
 import html
 import json
 import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import boto3
@@ -31,6 +32,7 @@ table = dynamodb.Table(table_name)
 P_KEY_PREFIX = "steam_news"
 APP_ID_SK_PREFIX = "appid_"
 NEWS_SK_PREFIX = "news_"
+NEWS_MAX_AGE_DAYS = 4
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -154,22 +156,28 @@ def process_app_id(app_id: str, game_title: str, webhook_url: str = None) -> int
         # Batch check which news items already exist
         existing_guids = batch_check_news_exists(app_id, guids)
 
-        # Process only new news items
-        new_news_count = 0
+        # Save all new news items to DynamoDB
+        new_entries = []
         for guid, entry in entry_map.items():
             if guid in existing_guids:
                 logger.debug(f"News already exists: {guid}")
                 continue
 
-            # Save new news to DynamoDB
             save_news(app_id, entry)
+            new_entries.append(entry)
 
-            # Post to Discord
-            post_to_discord(app_id, game_title, entry, webhook_url)
+        # Post only the latest new news item to Discord
+        if new_entries:
+            latest_entry = max(new_entries, key=get_entry_timestamp)
+            if is_recent(latest_entry):
+                post_to_discord(app_id, game_title, latest_entry, webhook_url)
+            else:
+                logger.info(
+                    f"Skipping Discord post for app {app_id}: "
+                    f"latest news is older than {NEWS_MAX_AGE_DAYS} days"
+                )
 
-            new_news_count += 1
-
-        return new_news_count
+        return len(new_entries)
 
     except Exception as e:
         logger.error(f"Error processing app ID {app_id}: {e}", exc_info=True)
@@ -282,6 +290,39 @@ def save_news(app_id: str, entry: Any) -> None:
     except Exception as e:
         logger.error(f"Error saving news to DynamoDB: {e}", exc_info=True)
         raise
+
+
+def get_entry_timestamp(entry: Any) -> float:
+    """Get the published timestamp (UTC epoch seconds) of a feed entry.
+
+    Args:
+        entry: RSS feed entry
+
+    Returns:
+        Epoch seconds, or 0 if the entry has no parseable published date
+    """
+    published_parsed = entry.get("published_parsed")
+    if not published_parsed:
+        return 0
+    return calendar.timegm(published_parsed)
+
+
+def is_recent(entry: Any, max_age_days: int = NEWS_MAX_AGE_DAYS) -> bool:
+    """Check whether a feed entry was published within max_age_days.
+
+    Args:
+        entry: RSS feed entry
+        max_age_days: Maximum age in days
+
+    Returns:
+        True if the entry has no parseable published date or is within max_age_days
+    """
+    timestamp = get_entry_timestamp(entry)
+    if not timestamp:
+        return True
+
+    published_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return datetime.now(tz=timezone.utc) - published_at <= timedelta(days=max_age_days)
 
 
 def strip_html_tags(text: str) -> str:

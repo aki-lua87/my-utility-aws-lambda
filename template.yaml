@@ -12,6 +12,10 @@ Globals:
     Runtime: python3.12
 
 Parameters:
+  VrcRankingConfigParameter:
+    Type: String
+    Default: ""
+    Description: SSM SecureString parameter containing registered worlds, boards and keys
   Environment:
     Type: String
     Default: dev
@@ -31,8 +35,83 @@ Parameters:
     Type: String
     Description: Discord webhook URL for posting XZY ranking data
     NoEcho: true
+  AwsCostWebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting monthly AWS cost report
+    NoEcho: true
+  SteamNewGamesWebHookUrl:
+    Type: String
+    Description: Discord webhook URL for posting new Steam game notifications
+    NoEcho: true
+
+Conditions:
+  HasVrcRankingConfigParameter: !Not [!Equals [!Ref VrcRankingConfigParameter, ""]]
 
 Resources:
+  VrcRankingTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: p_key
+          AttributeType: S
+        - AttributeName: s_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: p_key
+          KeyType: HASH
+        - AttributeName: s_key
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  VrcRankingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/web_api/vrc-ranking/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref VrcRankingTable
+          CONFIG_PARAMETER: !If
+            - HasVrcRankingConfigParameter
+            - !Ref VrcRankingConfigParameter
+            - !Sub /aki-utils/${Environment}/vrc-ranking/config
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+              Resource: !GetAtt VrcRankingTable.Arn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub
+                - arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ConfigPath}
+                - ConfigPath: !If
+                    - HasVrcRankingConfigParameter
+                    - !Ref VrcRankingConfigParameter
+                    - !Sub /aki-utils/${Environment}/vrc-ranking/config
+      Events:
+        Submit:
+          Type: Api
+          Properties:
+            Path: /vrc/ranking/submit
+            Method: GET
+        Records:
+          Type: Api
+          Properties:
+            Path: /vrc/ranking/records
+            Method: GET
+  # S3 Bucket for image cache
+  XzyRankImageCacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aki-utils-xzy-rank-image-cache-${Environment}
+
   # DynamoDB Table
   AkiUtilsTable:
     Type: AWS::DynamoDB::Table
@@ -65,7 +144,7 @@ Resources:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(15 23 * * ? *) # Every day at 9 AM JST
+            Schedule: cron(15 23 * * ? *)
             Description: Daily batch processing
             Enabled: true
 
@@ -124,24 +203,132 @@ Resources:
     Properties:
       CodeUri: src/batch/xzy-rank/
       Handler: app.lambda_handler
-      Timeout: 60
+      Timeout: 300
       Environment:
         Variables:
           TABLE_NAME: !Ref AkiUtilsTable
           XZY_WEBHOOK_URL: !Ref XzyWebHookUrl
+          IMAGE_CACHE_BUCKET: !Ref XzyRankImageCacheBucket
+          ANALYSIS_ENABLED: "true"
+          # Use Claude Sonnet 4.6 as the sole ranking analysis model.
+          ANALYSIS_MODELS: >-
+            [{"key":"claude-sonnet-4-6","display_name":"Claude Sonnet 4.6","model_id":"jp.anthropic.claude-sonnet-4-6"}]
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AkiUtilsTable
+        - S3CrudPolicy:
+            BucketName: !Ref XzyRankImageCacheBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
       Events:
         ScheduleEvent:
           Type: Schedule
           Properties:
-            Schedule: cron(0 16 ? * THU *) # Every Thursday at 1 AM JST (16:00 UTC Wednesday)
+            Schedule: cron(0 3 ? * THU *)
             Description: Weekly XZY ranking data fetch every Thursday at 1 AM JST
+            Enabled: true
+
+  XzyRankRefreshImagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/xzy-rank-refresh-images/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+          IMAGE_CACHE_BUCKET: !Ref XzyRankImageCacheBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AkiUtilsTable
+        - S3CrudPolicy:
+            BucketName: !Ref XzyRankImageCacheBucket
+      # Manual invocation only (sam local invoke / AWS console / CLI) — no schedule trigger.
+      # Use this to force-refresh the character image cache when a bad image got cached,
+      # without waiting for the next weekly XzyRankFunction run.
+
+  SteamNewGamesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/steam-new-games/
+      Handler: app.lambda_handler
+      Timeout: 120
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AkiUtilsTable
+          STEAM_NEW_GAMES_WEBHOOK_URL: !Ref SteamNewGamesWebHookUrl
+          BEDROCK_ANALYSIS_ENABLED: "true"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AkiUtilsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 4 * * ? *) # Daily at 12:00 JST
+            Description: Daily Steam new games check
+            Enabled: false
+
+  AwsCostDailyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/aws-cost/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          AWS_COST_WEBHOOK_URL: !Ref AwsCostWebHookUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:GetMetricStatistics
+                - cloudwatch:ListMetrics
+              Resource: "*"
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 3 * * ? *)
+            Description: Daily AWS cost report at 12:00 JST (CloudWatch Metrics / free)
+            Enabled: true
+
+  AwsCostMonthlyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/batch/aws-cost/
+      Handler: app_monthly.lambda_handler_monthly
+      Timeout: 30
+      Environment:
+        Variables:
+          AWS_COST_WEBHOOK_URL: !Ref AwsCostWebHookUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ce:GetCostAndUsage
+              Resource: "*"
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 3 1 * ? *)
+            Description: Monthly AWS cost report on 1st of each month at 12:00 JST (Cost Explorer / $0.01)
             Enabled: true
 
 # API GatewayのURLを出力
 Outputs:
+  VrcRankingApiRootUrl:
+    Description: "API root including the stage; use in Unity Online Ranking configuration"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
   SteamNewsApiUrl:
     Description: "API Gateway URL for Steam News API"
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/"

@@ -4,14 +4,22 @@ This function fetches XZY battle record ranking data from API,
 stores the latest list_id in DynamoDB, and posts the data to Discord.
 """
 
+import hashlib
+import io
 import json
 import logging
 import os
-from datetime import datetime
+import re
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from typing import Any
 
 import boto3
 import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont
 
 # Configure logging
 logger = logging.getLogger()
@@ -21,13 +29,48 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource("dynamodb")
 table_name = os.environ.get("TABLE_NAME", "aki-utils-dev")
 table = dynamodb.Table(table_name)
+s3 = boto3.client("s3")
+bedrock = boto3.client("bedrock-runtime", region_name="ap-northeast-1")
+image_cache_bucket = os.environ.get("IMAGE_CACHE_BUCKET", "")
+analysis_enabled = os.environ.get("ANALYSIS_ENABLED", os.environ.get("BEDROCK_ANALYSIS_ENABLED", "false")).lower() == "true"
 
 # Constants
 P_KEY = "xzy_rank"
 S_KEY = "latest_list_id"
+S_KEY_NEWS = "latest_news_id"
+S_KEY_ANALYSIS = "latest_analysis"  # Analysis history sort-key prefix
 API_BASE_URL = "https://xzy.shengtiangames.com/mini-game/xzy/battle-record/hot-rank"
+NEWS_BASE_URL = "https://xzyjp.shengtiangames.com/newsInfo"
 DEFAULT_LIST_ID = 106  # Starting list_id
-MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search
+DEFAULT_NEWS_ID = 2423  # Starting news ID (as of 2026-03-13)
+MAX_SEARCH_INCREMENT = 10  # Maximum number of increments to search for ranking
+NEWS_MAX_INCREMENT = 15  # Maximum forward increments to find latest news ID
+NEWS_SEARCH_DAYS = 7  # Days of patch notes to collect for analysis
+IMAGE_CACHE_PREFIX = "images/"  # S3 key prefix for cached images
+BEDROCK_MAX_TOKENS = 2000  # Budget large enough to finish within ANALYSIS_CHAR_LIMIT without cutting off
+ANALYSIS_CHAR_LIMIT = 3000  # Keep analysis within Discord's 4096-char embed description limit
+DEFAULT_ANALYSIS_MODELS = [
+    {
+        "key": "claude-sonnet-4-6",
+        "display_name": "Claude Sonnet 4.6",
+        "model_id": "jp.anthropic.claude-sonnet-4-6",
+    },
+]
+
+# Hiragana + Katakana unicode ranges for Japanese detection
+JAPANESE_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+# Keywords that indicate a patch note / update article
+PATCH_KEYWORDS = ["アップデート", "メンテナンス", "調整", "バランス", "修正", "強化", "弱体", "不具合"]
+# Title substrings that should be excluded from Bedrock analysis regardless of other conditions
+EXCLUDED_TITLE_KEYWORDS = ["星導使の", "PV"]
+
+# Image generation constants
+THUMBNAIL_SIZE = 80  # Character thumbnail size
+CHAR_SPACING = 10  # Spacing between characters horizontally
+CHAR_VERTICAL_SPACING = 75  # Vertical spacing between rows (includes stats height)
+SECTION_MARGIN = 40  # Margin around sections
+FONT_SIZE_TITLE = 24
+FONT_SIZE_STATS = 14
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -41,6 +84,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         Response dict with status code and body
     """
     try:
+        t_start = time.time()
         logger.info("Starting XZY ranking data fetch")
 
         # Get Discord webhook URL from environment
@@ -50,25 +94,90 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return {"statusCode": 500, "body": json.dumps({"error": "Webhook URL not configured"})}
 
         # Get last list_id from DynamoDB
+        t0 = time.time()
         last_list_id = get_last_list_id()
-        logger.info(f"Last list_id from DynamoDB: {last_list_id}")
+        logger.info(f"[{time.time() - t0:.2f}s] get_last_list_id: {last_list_id}")
 
         # Search for the latest list_id with data
+        t0 = time.time()
         latest_data, latest_list_id = find_latest_data(last_list_id)
+        logger.info(f"[{time.time() - t0:.2f}s] find_latest_data: list_id={latest_list_id}, count={len(latest_data)}")
 
         if not latest_data:
             logger.warning("No new data found")
             return {"statusCode": 200, "body": json.dumps({"message": "No new data found"})}
 
-        logger.info(f"Found latest data with list_id: {latest_list_id}")
-
         # Save the latest list_id to DynamoDB
+        t0 = time.time()
         save_last_list_id(latest_list_id)
+        logger.info(f"[{time.time() - t0:.2f}s] save_last_list_id")
 
-        # Post to Discord
-        post_to_discord(latest_data, latest_list_id, webhook_url)
+        # Fetch patch notes from the past week (run regardless of analysis_enabled
+        # so the latest news_id is always kept up to date in DynamoDB)
+        t0 = time.time()
+        last_news_id = get_last_news_id()
+        patch_notes, latest_news_id = fetch_recent_patch_notes(last_news_id)
+        save_last_news_id(latest_news_id)
+        logger.info(f"[{time.time() - t0:.2f}s] fetch_recent_patch_notes: {len(patch_notes)} patch notes, latest_news_id={latest_news_id}")
 
-        logger.info("Successfully completed XZY ranking data fetch")
+        # Post ranking images first so Discord ordering is deterministic even when
+        # one of the model calls is slow or fails.
+        t0 = time.time()
+        post_images_to_discord(latest_data, latest_list_id, webhook_url)
+        logger.info(f"[{time.time() - t0:.2f}s] post_images_to_discord")
+
+        # Multi-model Bedrock analysis (find previous list_id with different data,
+        # up to 5 decrements).
+        analysis_results: list[dict[str, Any]] = []
+        if analysis_enabled:
+            t0 = time.time()
+            current_shrunk = shrink_ranking_data(latest_data)
+            previous_data = None
+            prev_list_id = None
+
+            # Find previous week data (先週)
+            for decrement in range(1, 6):
+                candidate_id = latest_list_id - decrement
+                prev_response = fetch_ranking_data(candidate_id)
+                if not prev_response or prev_response.get("code") != 0 or not prev_response.get("data"):
+                    logger.warning(f"Could not fetch data for list_id {candidate_id}, stopping search")
+                    break
+                candidate_shrunk = shrink_ranking_data(prev_response["data"])
+                if candidate_shrunk != current_shrunk:
+                    previous_data = prev_response["data"]
+                    prev_list_id = candidate_id
+                    logger.info(f"Found previous week data at list_id {candidate_id} (decrement={decrement})")
+                    break
+                logger.info(f"list_id {candidate_id} is identical to current, trying next...")
+
+            if previous_data and prev_list_id is not None:
+                models = load_analysis_models()
+                analysis_results = analyze_with_models(
+                    models,
+                    latest_data,
+                    previous_data,
+                    prev_list_id,
+                    patch_notes or None,
+                )
+                logger.info(
+                    f"[{time.time() - t0:.2f}s] multi-model Bedrock analysis"
+                    f" (list_id {latest_list_id} vs {prev_list_id}, models={len(models)}" + (f", {len(patch_notes)} patch notes" if patch_notes else "") + ")"
+                )
+
+                for result in analysis_results:
+                    if result["analysis"]:
+                        save_last_analysis(
+                            result["model"],
+                            latest_list_id,
+                            prev_list_id,
+                            result["analysis"],
+                        )
+
+                post_analysis_results_to_discord(webhook_url, analysis_results)
+            else:
+                logger.warning("No different previous data found within 5 decrements, skipping analysis")
+
+        logger.info(f"[{time.time() - t_start:.2f}s] total: Successfully completed XZY ranking data fetch")
         return {
             "statusCode": 200,
             "body": json.dumps(
@@ -76,6 +185,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     "message": "Successfully processed XZY ranking data",
                     "list_id": latest_list_id,
                     "data_count": len(latest_data),
+                    "analysis_models": [result["model"]["display_name"] for result in analysis_results],
                 }
             ),
         }
@@ -127,6 +237,269 @@ def save_last_list_id(list_id: int) -> None:
     except Exception as e:
         logger.error(f"Error saving list_id to DynamoDB: {e}", exc_info=True)
         raise
+
+
+def get_last_news_id() -> int | None:
+    """Get the last processed news ID from DynamoDB.
+
+    Returns:
+        Last processed news ID, or None if not previously stored
+    """
+    try:
+        response = table.get_item(Key={"p_key": P_KEY, "s_key": S_KEY_NEWS})
+        if "Item" in response:
+            news_id = response["Item"].get("news_id")
+            logger.info(f"Retrieved news_id from DynamoDB: {news_id}")
+            return int(news_id) if news_id is not None else None
+        logger.info(f"No previous news_id found, will use default: {DEFAULT_NEWS_ID}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching news_id from DynamoDB: {e}", exc_info=True)
+        return None
+
+
+def save_last_news_id(news_id: int) -> None:
+    """Save the latest news ID to DynamoDB.
+
+    Args:
+        news_id: The latest news ID to save
+    """
+    try:
+        table.put_item(
+            Item={
+                "p_key": P_KEY,
+                "s_key": S_KEY_NEWS,
+                "news_id": news_id,
+                "updated_at": datetime.now().isoformat(),
+            }
+        )
+        logger.info(f"Saved news_id to DynamoDB: {news_id}")
+    except Exception as e:
+        logger.error(f"Error saving news_id to DynamoDB: {e}", exc_info=True)
+        raise
+
+
+def _analysis_sort_key(model_key: str, list_id: int) -> str:
+    """Return the immutable model/list-specific analysis history key."""
+    return f"{S_KEY_ANALYSIS}#{model_key}#{list_id:012d}"
+
+
+def get_last_analysis(model: dict[str, Any], list_id: int) -> str | None:
+    """Get one model's analysis for the exact comparison list ID.
+
+    Returns:
+        Analysis text for ``list_id``, or None if it has not been stored
+    """
+    try:
+        response = table.get_item(
+            Key={"p_key": P_KEY, "s_key": _analysis_sort_key(model["key"], list_id)}
+        )
+        if "Item" in response:
+            return response["Item"].get("analysis")
+        return None
+    except Exception as e:
+        logger.error(
+            f"Error fetching analysis for {model['key']} list_id={list_id} from DynamoDB: {e}",
+            exc_info=True,
+        )
+        return None
+
+
+def save_last_analysis(
+    model: dict[str, Any],
+    list_id: int,
+    compared_list_id: int,
+    analysis: str,
+) -> None:
+    """Save analysis history for one model and ranking list ID.
+
+    Args:
+        model: Model configuration
+        list_id: Ranking list ID analyzed as the current data
+        compared_list_id: Ranking list ID used as the previous data
+        analysis: The analysis text to save
+    """
+    try:
+        table.put_item(
+            Item={
+                "p_key": P_KEY,
+                "s_key": _analysis_sort_key(model["key"], list_id),
+                "model_key": model["key"],
+                "model_id": model["model_id"],
+                "model_name": model["display_name"],
+                "list_id": list_id,
+                "compared_list_id": compared_list_id,
+                "analysis": analysis,
+                "updated_at": datetime.now().isoformat(),
+            }
+        )
+        logger.info(
+            f"Saved {model['display_name']} analysis to DynamoDB: "
+            f"list_id={list_id}, compared_list_id={compared_list_id}, {len(analysis)} chars"
+        )
+    except Exception as e:
+        logger.error(
+            f"Error saving {model['display_name']} analysis to DynamoDB: {e}",
+            exc_info=True,
+        )
+
+
+def fetch_news_article(news_id: int) -> dict[str, Any] | None:
+    """Fetch and parse a news article from xzyjp.shengtiangames.com.
+
+    Args:
+        news_id: Article ID to fetch
+
+    Returns:
+        - Dict with id, url, title, date, content if the article exists
+        - None if the article does not exist (HTTP 404) – caller should stop scanning
+        - Dict with "_error": True if a transient error occurred – caller should skip and continue
+    """
+    url = f"{NEWS_BASE_URL}?id={news_id}"
+    try:
+        resp = requests.get(url, timeout=8)
+
+        if resp.status_code == 404:
+            logger.info(f"news_id {news_id} not found (404)")
+            return None
+
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer"]):
+            tag.decompose()
+
+        # Extract date from <p class='flex-0'>YYYY-MM-DD</p> (preferred)
+        # Fall back to first YYYY-MM-DD found anywhere in the page text
+        article_date: datetime | None = None
+        date_elem = soup.find("p", class_="flex-0")
+        if date_elem:
+            date_text = date_elem.get_text(strip=True)
+            m = re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text)
+            if m:
+                article_date = datetime.strptime(date_text, "%Y-%m-%d")
+        if article_date is None:
+            text_full = soup.get_text(separator="\n", strip=True)
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text_full)
+            if date_match:
+                article_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
+
+        title_elem = soup.find("h2") or soup.find("h1")
+        title = title_elem.get_text(strip=True) if title_elem else ""
+
+        text = soup.get_text(separator="\n", strip=True)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        content = "\n".join(lines[:60])
+
+        return {
+            "id": news_id,
+            "url": url,
+            "title": title,
+            "date": article_date,
+            "content": content,
+        }
+    except requests.HTTPError as e:
+        logger.warning(f"HTTP error fetching news {news_id}: {e}")
+        return {"_error": True}
+    except Exception as e:
+        logger.warning(f"Error fetching news {news_id}: {e}")
+        return {"_error": True}
+
+
+def is_japanese_article(article: dict[str, Any]) -> bool:
+    """Return True if the article contains Japanese (hiragana/katakana) text."""
+    text = article.get("title", "") + " " + article.get("content", "")
+    return bool(JAPANESE_RE.search(text))
+
+
+def is_excluded_article(article: dict[str, Any]) -> bool:
+    """Return True if the article should be excluded from Bedrock analysis by title."""
+    title = article.get("title", "")
+    return any(kw in title for kw in EXCLUDED_TITLE_KEYWORDS)
+
+
+def is_patch_note(article: dict[str, Any]) -> bool:
+    """Return True if the article is about updates / character adjustments."""
+    text = article.get("title", "") + article.get("content", "")
+    return any(kw in text for kw in PATCH_KEYWORDS)
+
+
+def fetch_recent_patch_notes(last_news_id: int | None) -> tuple[list[dict[str, Any]], int]:
+    """Fetch Japanese patch-note articles published within the last NEWS_SEARCH_DAYS days.
+
+    Strategy:
+    - Step 1 (forward scan): increment from last_news_id (or DEFAULT_NEWS_ID on first run)
+      to find the absolute latest published ID.
+    - Step 2 (backward scan): decrement one-by-one from the latest ID.
+      Stop immediately when:
+        (a) the article does not exist (HTTP 404) → end of published range, or
+        (b) the article's date is older than NEWS_SEARCH_DAYS days.
+      On transient fetch errors the ID is skipped and scanning continues.
+
+    Args:
+        last_news_id: Last stored news ID from DynamoDB (None on first run)
+
+    Returns:
+        Tuple of (patch_notes sorted newest-first, latest_news_id found)
+    """
+    start_id = last_news_id if last_news_id is not None else DEFAULT_NEWS_ID
+    cutoff = datetime.now() - timedelta(days=NEWS_SEARCH_DAYS)
+
+    # Step 1: Scan forward to find the absolute latest published ID
+    latest_id = start_id
+    for i in range(1, NEWS_MAX_INCREMENT + 1):
+        result = fetch_news_article(start_id + i)
+        if result is None:
+            # 404 – no article at this ID, stop forward scan
+            break
+        if result.get("_error"):
+            # Transient error – stop forward scan conservatively
+            break
+        latest_id = start_id + i
+        logger.info(f"Forward scan: found news_id {latest_id}")
+
+    logger.info(f"Latest news_id found: {latest_id} (started from {start_id})")
+
+    # Step 2: Sequential backward scan
+    # Stop on 404 (article doesn't exist) or date older than NEWS_SEARCH_DAYS.
+    patch_notes: list[dict[str, Any]] = []
+    for decrement in range(latest_id + 1):  # safety upper-bound: never loop more than latest_id times
+        nid = latest_id - decrement
+        if nid <= 0:
+            break
+
+        article = fetch_news_article(nid)
+
+        if article is None:
+            # 404: article does not exist – stop scanning
+            logger.info(f"news_id {nid} not found (404) – stopping backward scan")
+            break
+
+        if article.get("_error"):
+            # Transient error – skip this ID and continue
+            logger.info(f"news_id {nid} fetch error – skipping")
+            continue
+
+        if article["date"] is None:
+            # Date could not be parsed – skip but keep scanning
+            logger.info(f"news_id {nid} has no parseable date – skipping")
+            continue
+
+        if article["date"] < cutoff:
+            logger.info(f"news_id {nid} ({article['date'].date()}) is older than {NEWS_SEARCH_DAYS} days – stopping backward scan")
+            break
+
+        if is_excluded_article(article):
+            logger.info(f"Excluded news_id {nid} (title filter): {article['title'][:60]}")
+        elif is_japanese_article(article) and is_patch_note(article):
+            patch_notes.append(article)
+            logger.info(f"Patch note found: id={nid}, title={article['title'][:60]}, date={article['date'].date()}")
+        else:
+            reason = "non-Japanese" if not is_japanese_article(article) else "not a patch note"
+            logger.info(f"Skipped news_id {nid} ({reason}): {article['title'][:60]}")
+
+    logger.info(f"fetch_recent_patch_notes: {len(patch_notes)} patch notes in last {NEWS_SEARCH_DAYS} days")
+    return patch_notes, latest_id
 
 
 def fetch_ranking_data(list_id: int) -> dict[str, Any] | None:
@@ -259,29 +632,225 @@ def create_embed_chunk(lines: list[str], list_id: int, chunk_index: int) -> dict
         Discord embed dict
     """
     description = "\n".join(lines)
-    
+
     title = "今週の 2v2 キャラランキング (6000-8000帯)"
     if chunk_index > 0:
         title += f" (続き {chunk_index + 1})"
-    
+
     embed = {
         "title": title,
         "description": description,
         "color": 0x5865F2,  # Discord blurple color
     }
-    
+
     # Add footer only to the last chunk (will be the first/only chunk initially)
     if chunk_index == 0 or len(lines) < 50:  # Heuristic: if small, likely the last chunk
-        embed["footer"] = {
-            "text": f"List ID: {list_id} | 取得日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        }
+        embed["footer"] = {"text": f"List ID: {list_id} | 取得日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
         embed["timestamp"] = datetime.now().isoformat()
-    
+
     return embed
 
 
-def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) -> None:
-    """Post ranking data to Discord webhook.
+def shrink_ranking_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract only fields needed for analysis, sorted by on_rate descending.
+
+    Args:
+        data: Raw ranking data from API
+
+    Returns:
+        Minimal list with name_jp, cost, win_rate, on_rate, ban_rate only
+    """
+    return [
+        {
+            "name": item.get("role", {}).get("name_jp", "Unknown"),
+            "cost": item.get("role", {}).get("cost", "?"),
+            "win_rate": item.get("win_rate", "0"),
+            "on_rate": item.get("on_rate", "0"),
+            "ban_rate": item.get("ban_rate", "0"),
+        }
+        for item in sorted(data, key=lambda x: float(x.get("on_rate", 0)), reverse=True)
+    ]
+
+
+def load_analysis_models() -> list[dict[str, Any]]:
+    """Load ordered model configuration from ANALYSIS_MODELS.
+
+    ANALYSIS_MODELS is a JSON array. Each item must contain a stable ``key``, a
+    Discord ``display_name``, and the Bedrock ``model_id``. Editing this one
+    setting is enough to add, remove, or reorder comparison models. Optional
+    ``additional_model_request_fields`` are passed through to Converse.
+    """
+    raw = os.environ.get("ANALYSIS_MODELS")
+    models = json.loads(raw) if raw else DEFAULT_ANALYSIS_MODELS
+    if not isinstance(models, list) or not models:
+        raise ValueError("ANALYSIS_MODELS must be a non-empty JSON array")
+
+    normalized: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for index, model in enumerate(models):
+        if not isinstance(model, dict):
+            raise ValueError(f"ANALYSIS_MODELS[{index}] must be an object")
+        normalized_model = {field: str(model.get(field, "")).strip() for field in ("key", "display_name", "model_id")}
+        missing = [field for field, value in normalized_model.items() if not value]
+        if missing:
+            raise ValueError(f"ANALYSIS_MODELS[{index}] is missing: {', '.join(missing)}")
+        if normalized_model["key"] in seen_keys:
+            raise ValueError(f"Duplicate ANALYSIS_MODELS key: {normalized_model['key']}")
+        additional_fields = model.get("additional_model_request_fields")
+        if additional_fields is not None:
+            if not isinstance(additional_fields, dict):
+                raise ValueError(
+                    f"ANALYSIS_MODELS[{index}].additional_model_request_fields must be an object"
+                )
+            normalized_model["additional_model_request_fields"] = additional_fields
+        seen_keys.add(normalized_model["key"])
+        normalized.append(normalized_model)
+    return normalized
+
+
+def build_analysis_prompt(
+    current_data: list[dict[str, Any]],
+    previous_data: list[dict[str, Any]],
+    patch_notes: list[dict[str, Any]] | None = None,
+    previous_analysis: str | None = None,
+) -> str:
+    """Build the provider-neutral prompt shared by all comparison models."""
+    current_summary = shrink_ranking_data(current_data)
+    previous_summary = shrink_ranking_data(previous_data)
+    logger.info(f"current_summary: {current_summary}")
+    logger.info(f"previous_summary: {previous_summary}")
+
+    patch_notes_section = ""
+    if patch_notes:
+        notes_text = "\n\n".join(f"### {note['title']} ({note['date'].strftime('%Y-%m-%d')})\n" + "\n".join(note["content"].splitlines()[:40]) for note in patch_notes)
+        patch_notes_section = f"\n\n# 直近1週間のキャラクター調整情報\n{notes_text}"
+
+    previous_analysis_section = ""
+    if previous_analysis:
+        previous_analysis_section = f"\n\n# 前回（先週）の同一モデルによる分析結果\n{previous_analysis}"
+
+    return f"""あなたはゲーム「星の翼(星之翼)」の2v2キャラクターランキングを分析するアナリストです。
+先週と今週のランキングデータを比較して、日本語で分析してください。
+
+# 先週のランキング（出場率順）
+{json.dumps(previous_summary, ensure_ascii=False, indent=2)}
+
+# 今週のランキング（出場率順）
+{json.dumps(current_summary, ensure_ascii=False, indent=2)}{patch_notes_section}{previous_analysis_section}
+
+以下の5項目の見出しで分析してください。キャラクター調整情報がある場合は、それぞれの調整が上方修正（強化）か下方修正（弱体化）かを判断し、ランキングへの影響を該当する項目で触れてください。前回の分析結果がある場合は、前回指摘した傾向が今週どうなったかを参考にしつつ、関連する項目で簡潔に触れてください（無理に触れる必要はありません）。同じキャラクターを複数の項目で重複して詳述せず、最も適した項目で評価してください。
+
+## 新キャラ評価
+今週新たにランキングに登場したキャラクター（先週のランキングに存在しないキャラ）がいる場合のみ、その性能（勝率・出場率・BAN率）を評価してください。いない場合はこの項目（見出しを含む）自体を出力しないでください。
+
+## 環境上位キャラ評価
+出場率が1.1%未満のキャラクターは対象外とした上で、出場率が今週上位3体のキャラクターについて、強さの理由や採用率の高さ、先週からの変化を評価してください。
+
+## 高BAN率キャラ評価
+今週のBAN率が上位3体のキャラクターを候補とし、BAN率の高さが環境への影響力や対策の難しさを示しているキャラクターを最大2体まで評価してください。出場率が1.1%未満でも対象外にしないでください。先週からのBAN率の変化、勝率・出場率との関係も踏まえ、単に数値を並べるのではなくBANされやすいと考えられる理由を述べてください。該当するキャラクターがいない場合は「特になし」と記載してください。
+
+## その他の評価変動キャラ
+「環境上位キャラ評価」と「高BAN率キャラ評価」で取り上げたキャラクター以外から、出場率・勝率・BAN率が先週から大きく変動した（上昇または下降した）キャラクターについて、変化と考えられる要因が大きい順に最大3体まで述べてください。原則として出場率1.1%以上を対象としますが、BAN率が今週上位3体、またはBAN率の変動が特に大きいキャラクターは、出場率1.1%未満でも対象に含めてください。該当するキャラクターがいない場合は「特になし」と記載してください。
+
+## 全体サマリ
+今週の環境全体の傾向を2〜3行でまとめてください。
+
+全体で{ANALYSIS_CHAR_LIMIT}文字以内に収め、各項目は簡潔に、文章を最後まで書き切ってください。"""
+
+
+def analyze_with_bedrock(
+    model: dict[str, Any],
+    current_data: list[dict[str, Any]],
+    previous_data: list[dict[str, Any]],
+    patch_notes: list[dict[str, Any]] | None = None,
+    previous_analysis: str | None = None,
+) -> str | None:
+    """Analyze ranking changes with one model through Bedrock Converse.
+
+    Args:
+        model: Model configuration
+        current_data: Current week's ranking data
+        previous_data: Previous week's ranking data
+        patch_notes: Japanese patch note articles from the past week (optional)
+        previous_analysis: Last week's analysis text, for continuity (optional)
+
+    Returns:
+        Analysis text or None if disabled/failed
+    """
+    if not analysis_enabled:
+        return None
+
+    try:
+        prompt = build_analysis_prompt(current_data, previous_data, patch_notes, previous_analysis)
+
+        converse_args = {
+            "modelId": model["model_id"],
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": {"maxTokens": BEDROCK_MAX_TOKENS},
+        }
+        if additional_fields := model.get("additional_model_request_fields"):
+            converse_args["additionalModelRequestFields"] = additional_fields
+
+        response = bedrock.converse(
+            **converse_args,
+        )
+        content = response["output"]["message"]["content"]
+        analysis = next((block["text"] for block in content if block.get("text")), None)
+        if not analysis:
+            raise ValueError("Bedrock response did not contain a text block")
+        logger.info(f"{model['display_name']} analysis completed: {len(analysis)} chars")
+        return analysis
+
+    except Exception as e:
+        logger.error(f"{model['display_name']} analysis failed: {e}", exc_info=True)
+        return None
+
+
+def analyze_with_models(
+    models: list[dict[str, Any]],
+    current_data: list[dict[str, Any]],
+    previous_data: list[dict[str, Any]],
+    previous_list_id: int,
+    patch_notes: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Run independent model analyses concurrently and retain config order."""
+    previous_by_key = {
+        model["key"]: get_last_analysis(model, previous_list_id) for model in models
+    }
+    analyses_by_key: dict[str, str | None] = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(models), 4)) as executor:
+        futures = {
+            executor.submit(
+                analyze_with_bedrock,
+                model,
+                current_data,
+                previous_data,
+                patch_notes,
+                previous_by_key[model["key"]],
+            ): model
+            for model in models
+        }
+        for future in as_completed(futures):
+            model = futures[future]
+            try:
+                analyses_by_key[model["key"]] = future.result()
+            except Exception as e:
+                logger.error(
+                    f"Unexpected {model['display_name']} analysis error: {e}",
+                    exc_info=True,
+                )
+                analyses_by_key[model["key"]] = None
+
+    return [{"model": model, "analysis": analyses_by_key.get(model["key"])} for model in models]
+
+
+def post_images_to_discord(
+    data: list[dict[str, Any]],
+    list_id: int,
+    webhook_url: str,
+) -> None:
+    """Post ranking images as the first Discord message.
 
     Args:
         data: Ranking data from API
@@ -289,21 +858,343 @@ def post_to_discord(data: list[dict[str, Any]], list_id: int, webhook_url: str) 
         webhook_url: Discord webhook URL
     """
     try:
-        embeds = format_ranking_message(data, list_id)
-        
-        # Discord allows up to 10 embeds per message
-        # If we have more, send multiple messages
-        for i in range(0, len(embeds), 10):
-            batch_embeds = embeds[i:i+10]
-            payload = {"embeds": batch_embeds}
+        # Sort by on_rate for image generation
+        sorted_data = sorted(data, key=lambda x: float(x.get("on_rate", 0)), reverse=True)
 
-            response = requests.post(webhook_url, json=payload, timeout=10)
-            response.raise_for_status()
-            
-            logger.info(f"Posted {len(batch_embeds)} embed(s) to Discord (batch {i//10 + 1})")
+        # Generate ranking images
+        t0 = time.time()
+        images = generate_ranking_images(sorted_data)
+        logger.info(f"[{time.time() - t0:.2f}s] generate_ranking_images: {len(images)} image(s)")
 
-        logger.info(f"Posted ranking data to Discord (list_id: {list_id}, total embeds: {len(embeds)})")
+        # Encode all images to bytes
+        t0 = time.time()
+        encoded = []
+        for filename, img in images:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            encoded.append((filename, buf))
+        logger.info(f"[{time.time() - t0:.2f}s] encode {len(encoded)} images")
+
+        # Attach all images in a single Discord message (max 10 files)
+        files = {f"files[{i}]": (filename, buf, "image/png") for i, (filename, buf) in enumerate(encoded)}
+        payload: dict[str, Any] = {"content": "今週の 2v2 キャラランキング (6000-8000帯)"}
+
+        t0 = time.time()
+        response = requests.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files, timeout=60)
+        response.raise_for_status()
+        logger.info(f"[{time.time() - t0:.2f}s] posted {len(encoded)} images to Discord in single message")
 
     except Exception as e:
-        logger.error(f"Error posting to Discord: {e}", exc_info=True)
+        logger.error(f"Error posting images to Discord: {e}", exc_info=True)
         raise
+
+
+def post_analysis_results_to_discord(webhook_url: str, results: list[dict[str, Any]]) -> None:
+    """Post one ordered Discord message per model after the image message."""
+    for result in results:
+        model = result["model"]
+        analysis = result["analysis"]
+        if analysis:
+            heading = f"**{model['display_name']}**\n\n"
+            description = heading + analysis[: 4096 - len(heading)]
+            color = 0x5865F2
+        else:
+            description = f"**{model['display_name']}**\n\n解析に失敗しました。。。"
+            color = 0xED4245
+
+        payload = {
+            "embeds": [{"description": description, "color": color}],
+            "allowed_mentions": {"parse": []},
+        }
+        try:
+            response = requests.post(webhook_url, json=payload, timeout=20)
+            response.raise_for_status()
+            logger.info(f"Posted {model['display_name']} analysis to Discord")
+        except Exception as e:
+            # One model's Discord failure must not suppress the remaining results.
+            logger.error(
+                f"Failed to post {model['display_name']} analysis to Discord: {e}",
+                exc_info=True,
+            )
+
+
+def group_by_cost(data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group characters by cost, maintaining on_rate sort order.
+
+    Args:
+        data: Ranking data from API (should be pre-sorted by on_rate)
+
+    Returns:
+        Dict: {cost: [characters sorted by on_rate]}
+    """
+    grouped = defaultdict(list)
+
+    for item in data:
+        role = item.get("role", {})
+        cost = role.get("cost", "Unknown")
+        grouped[cost].append(item)
+
+    return grouped
+
+
+def _s3_key_from_url(url: str) -> str:
+    """Generate S3 cache key from image URL."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    return f"{IMAGE_CACHE_PREFIX}{url_hash}.png"
+
+
+def _load_from_s3_cache(s3_key: str, size: tuple[int, int] | None) -> Image.Image | None:
+    """Try to load image from S3 cache.
+
+    Returns:
+        PIL Image object or None if not cached
+    """
+    if not image_cache_bucket:
+        return None
+    try:
+        obj = s3.get_object(Bucket=image_cache_bucket, Key=s3_key)
+        img = Image.open(io.BytesIO(obj["Body"].read()))
+        if size:
+            img = img.resize(size, Image.Resampling.LANCZOS)
+        return img
+    except s3.exceptions.NoSuchKey:
+        return None
+    except Exception as e:
+        logger.warning(f"S3 cache read error ({s3_key}): {e}")
+        return None
+
+
+def _save_to_s3_cache(s3_key: str, img: Image.Image) -> None:
+    """Save image to S3 cache."""
+    if not image_cache_bucket:
+        return
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        s3.put_object(Bucket=image_cache_bucket, Key=s3_key, Body=buf, ContentType="image/png")
+        logger.info(f"Saved to S3 cache: {s3_key}")
+    except Exception as e:
+        logger.warning(f"S3 cache write error ({s3_key}): {e}")
+
+
+def download_image(url: str, size: tuple[int, int] = None, retries: int = 3) -> Image.Image | None:
+    """Download and optionally resize an image from URL. S3 cache is checked first.
+
+    Args:
+        url: Image URL
+        size: Optional target size (width, height)
+        retries: Number of retry attempts on failure
+
+    Returns:
+        PIL Image object or None if download fails
+    """
+    s3_key = _s3_key_from_url(url)
+
+    # Check S3 cache first
+    cached = _load_from_s3_cache(s3_key, size)
+    if cached:
+        logger.info(f"S3 cache hit: {s3_key}")
+        return cached
+
+    # Download from origin with exponential backoff
+    for attempt in range(1, retries + 1):
+        timeout = 2**attempt  # 2s, 4s, 8s
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+
+            img = Image.open(io.BytesIO(response.content))
+
+            # Save original (unresized) image to S3 cache
+            _save_to_s3_cache(s3_key, img)
+
+            if size:
+                img = img.resize(size, Image.Resampling.LANCZOS)
+
+            return img
+        except Exception as e:
+            if attempt < retries:
+                wait = 2 ** (attempt - 1)  # 1s, 2s
+                logger.warning(f"Failed to download image (attempt {attempt}/{retries}, timeout={timeout}s) from {url}: {e}, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.warning(f"Failed to download image from {url}: {e}")
+
+    return None
+
+
+def create_placeholder_image(size: tuple[int, int]) -> Image.Image:
+    """Create a placeholder image when character thumbnail is unavailable.
+
+    Args:
+        size: Image size (width, height)
+
+    Returns:
+        PIL Image object
+    """
+    img = Image.new("RGB", size, color=(50, 50, 50))
+    draw = ImageDraw.Draw(img)
+
+    # Draw a simple "?" in the center
+    text = "?"
+    # Use default font for now
+    bbox = draw.textbbox((0, 0), text)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    position = ((size[0] - text_width) // 2, (size[1] - text_height) // 2)
+    draw.text(position, text, fill=(200, 200, 200))
+
+    return img
+
+
+def get_font(size: int) -> ImageFont.FreeTypeFont:
+    """Get font for text rendering. Falls back to default if custom font unavailable.
+
+    Args:
+        size: Font size
+
+    Returns:
+        ImageFont object
+    """
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Try to use Japanese font if available
+    font_paths = [
+        os.path.join(script_dir, "fonts", "NotoSansJP-Regular.ttf"),  # Local font
+        "/var/task/fonts/NotoSansJP-Regular.ttf",  # Lambda environment
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",  # Lambda Linux
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",  # macOS
+        "C:\\Windows\\Fonts\\msgothic.ttc",  # Windows
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+
+    for font_path in font_paths:
+        try:
+            return ImageFont.truetype(font_path, size)
+        except OSError:
+            continue
+
+    # Fallback to default font
+    logger.warning("Japanese font not found, using default font")
+    return ImageFont.load_default()
+
+
+def generate_cost_image(cost: str, chars: list[dict[str, Any]]) -> Image.Image:
+    """Generate ranking image for a specific cost category.
+
+    Args:
+        cost: Cost value (e.g., "1.0", "1.5")
+        chars: List of characters sorted by on_rate
+
+    Returns:
+        PIL Image object
+    """
+    # Calculate image dimensions
+    max_chars_per_row = 4
+    char_box_width = THUMBNAIL_SIZE + CHAR_SPACING
+    char_box_height = THUMBNAIL_SIZE + CHAR_VERTICAL_SPACING
+
+    # Calculate total height needed
+    rows = (len(chars) + max_chars_per_row - 1) // max_chars_per_row
+    total_height = SECTION_MARGIN  # Top margin
+    total_height += 40  # Title height
+    total_height += rows * char_box_height
+    total_height += SECTION_MARGIN  # Bottom margin
+
+    img_width = SECTION_MARGIN * 2 + max_chars_per_row * char_box_width
+    img = Image.new("RGB", (img_width, total_height), color=(30, 30, 40))
+    draw = ImageDraw.Draw(img)
+
+    # Fonts
+    title_font = get_font(FONT_SIZE_TITLE)
+    stats_font = get_font(FONT_SIZE_STATS)
+
+    # Draw title
+    title = f"コスト {cost} (出場率順)"
+    draw.text((SECTION_MARGIN, SECTION_MARGIN), title, fill=(255, 255, 255), font=title_font)
+
+    y_offset = SECTION_MARGIN + 40
+
+    # Pre-fetch character info
+    char_infos = []
+    for char_data in chars:
+        role = char_data.get("role", {})
+        char_infos.append(
+            {
+                "avatar_url": role.get("avatar_link") or role.get("avatar_link_xcx") or role.get("img_preview"),
+                "name": role.get("name_jp", "Unknown"),
+                "win_rate": char_data.get("win_rate", "0"),
+                "on_rate": char_data.get("on_rate", "0"),
+                "ban_rate": char_data.get("ban_rate", "0"),
+            }
+        )
+
+    # Download all thumbnails in parallel
+    def fetch(idx: int, info: dict) -> tuple[int, Image.Image]:
+        t0 = time.time()
+        thumb = download_image(info["avatar_url"], (THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+        elapsed = time.time() - t0
+        if not thumb:
+            logger.info(f"[{elapsed:.2f}s] download failed, using placeholder: {info['name']}")
+            thumb = create_placeholder_image((THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+        else:
+            logger.info(f"[{elapsed:.2f}s] download OK: {info['name']}")
+        return idx, thumb
+
+    thumbnails: dict[int, Image.Image] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch, i, info): i for i, info in enumerate(char_infos)}
+        for future in as_completed(futures):
+            idx, thumb = future.result()
+            thumbnails[idx] = thumb
+
+    # Draw characters in on_rate order
+    for i, info in enumerate(char_infos):
+        col = i % max_chars_per_row
+        row = i // max_chars_per_row
+
+        x = SECTION_MARGIN + col * char_box_width
+        y = y_offset + row * char_box_height
+
+        img.paste(thumbnails[i], (x, y))
+
+        # Draw stats below thumbnail
+        stats_y = y + THUMBNAIL_SIZE + 5
+
+        # Draw character name (truncate if too long)
+        name_display = info["name"] if len(info["name"]) <= 6 else info["name"][:5] + "..."
+        draw.text((x, stats_y), name_display, fill=(220, 220, 220), font=stats_font)
+        draw.text((x, stats_y + 15), f"勝率: {info['win_rate']}%", fill=(100, 200, 100), font=stats_font)
+        draw.text((x, stats_y + 28), f"出場率: {info['on_rate']}%", fill=(100, 150, 255), font=stats_font)
+        draw.text((x, stats_y + 41), f"BAN率: {info['ban_rate']}%", fill=(255, 100, 100), font=stats_font)
+
+    return img
+
+
+def generate_ranking_images(data: list[dict[str, Any]]) -> list[tuple[str, Image.Image]]:
+    """Generate a single ranking image with all costs.
+
+    Args:
+        data: Ranking data from API (should be pre-sorted by on_rate)
+
+    Returns:
+        List with single (filename, image) tuple
+    """
+    # Group by cost (maintaining on_rate sort order)
+    grouped = group_by_cost(data)
+
+    # Generate individual cost images
+    result = []
+    for cost in sorted(grouped.keys(), key=lambda x: float(x) if x != "Unknown" else -1, reverse=True):
+        chars = grouped[cost]
+        t0 = time.time()
+        img = generate_cost_image(cost, chars)
+        cost_str = str(cost).replace(".", "_")
+        filename = f"xzy_rank_cost_{cost_str}.png"
+        logger.info(f"[{time.time() - t0:.2f}s] generate_cost_image: cost={cost}, chars={len(chars)}, size={img.width}x{img.height}px")
+        result.append((filename, img))
+
+    return result

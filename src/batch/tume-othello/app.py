@@ -37,8 +37,9 @@ def fetch_game_data() -> tuple[str, str]:
         html = response.text
 
         board_match = re.search(r'var gBoard = "([^"]+)"', html)
+        print(f"Fetched board data: {board_match.group(1) if board_match else 'Not found'}")
         turn_match = re.search(r'var gTurn\s*=\s*"([^"]+)"', html)
-
+        print(f"Fetched turn data: {turn_match.group(1) if turn_match else 'Not found'}")
         if not board_match or not turn_match:
             raise ValueError("盤面データまたは手番情報が見つかりません")
 
@@ -102,13 +103,7 @@ def post_to_discord(image: Image.Image, turn: str) -> None:
         img_bytes.seek(0)
 
         files = {"file": ("othello_board.png", img_bytes, "image/png")}
-        data = {
-            "content": "今日の詰めオセロの時間だぞ"
-            + "("
-            + TURN_MESSAGES.get(turn, "")
-            + ")\n"
-            + OTHELLO_URL
-        }
+        data = {"content": "今日の詰めオセロの時間だぞ" + "(" + TURN_MESSAGES.get(turn, "") + ")\n" + OTHELLO_URL}
 
         response = requests.post(WEB_HOOK_URL, data=data, files=files, timeout=10)
         response.raise_for_status()
