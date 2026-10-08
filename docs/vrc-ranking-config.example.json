@@ -1,0 +1,12 @@
+{
+  "worlds": {
+    "wrld_dab8d6d0-fe65-4aa2-b54c-0c150e787648": {
+      "keys": { "k1": "REPLACE_WITH_64_HEX_CHARACTERS" },
+      "max_age_seconds": 604800,
+      "boards": {
+        "hard_solo": { "order": "asc", "min_score": 1, "max_score": 86400000, "min_participants": 1, "max_participants": 1, "rules_version": 1 },
+        "hard_multi": { "order": "asc", "min_score": 1, "max_score": 86400000, "min_participants": 1, "max_participants": 80, "rules_version": 1 }
+      }
+    }
+  }
+}
